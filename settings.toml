@@ -110,3 +110,13 @@ polling_interval = 1000
 
   [rules.action]
   target_monitor = 2
+
+[[rules]]
+  name = "特定のウィンドウを仮想デスクトップ2へ"
+
+  [rules.condition]
+  title = "仮想デスクトップ2へ移動"
+
+  [rules.action]
+  # 仮想デスクトップの番号（1から始まる）
+  target_workspace = 2

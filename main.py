@@ -11,6 +11,7 @@ import os
 import ctypes
 import re
 from screeninfo import get_monitors
+from pyvda import AppView, VirtualDesktop, get_virtual_desktops
 
 # --- 定数 ---
 SETTINGS_FILE = "settings.toml"
@@ -42,6 +43,9 @@ def setup_logging(level: int = logging.INFO):
             logging.StreamHandler()
         ]
     )
+    # ライブラリのデバッグログを抑制
+    logging.getLogger("pyvda").setLevel(logging.INFO)
+    logging.getLogger("PIL").setLevel(logging.INFO)
 
 # --- 設定管理 ---
 class Settings:
@@ -217,6 +221,7 @@ class WindowManager:
         self.processed_windows = set()
         self.running_event = threading.Event()
         self.running_event.set() # 初期状態は実行中
+        self.lock = threading.Lock()
 
         if not self.settings.globals.get("apply_on_startup", True):
             logging.info("起動時のルール適用はスキップします（既存のウィンドウは対象外）。")
@@ -293,52 +298,69 @@ class WindowManager:
         polling_interval_ms = self.settings.globals.get("polling_interval", 1000)
         while True:
             self.running_event.wait() # イベントがクリアされるとここでブロック
-            try:
-                all_windows = gw.getAllWindows()
-                current_handles = {w._hWnd for w in all_windows}
+            
+            with self.lock:
+                polling_interval_ms = self.settings.globals.get("polling_interval", 1000)
+                try:
+                    all_windows = gw.getAllWindows()
+                    current_handles = {w._hWnd for w in all_windows}
 
-                for window in all_windows:
-                    if not (window.visible and window.title and window._hWnd not in self.processed_windows):
-                        continue
+                    for window in all_windows:
+                        if not (window.visible and window.title and window._hWnd not in self.processed_windows):
+                            continue
 
-                    process_name = self._get_process_name(window._hWnd)
-                    
-                    for rule in self.settings.rules:
-                        if self._check_rule_conditions(window, process_name, rule.get("condition", {})):
-                            rule_name = rule.get("name", "無名ルール")
-                            logging.info(f'ルール "{rule_name}" に一致: "{window.title}" (プロセス: {process_name})')
-                            action = rule.get("action", {})
+                        process_name = self._get_process_name(window._hWnd)
+                        
+                        for rule in self.settings.rules:
+                            if self._check_rule_conditions(window, process_name, rule.get("condition", {})):
+                                rule_name = rule.get("name", "無名ルール")
+                                logging.info(f'ルール "{rule_name}" に一致: "{window.title}" (プロセス: {process_name})')
+                                action = rule.get("action", {})
 
-                            try:
-                                if action.get("maximize", "").upper() == "ON":
-                                    window.maximize()
-                                    logging.info(" -> ウィンドウを最大化しました。")
-                                elif action.get("minimize", "").upper() == "ON":
-                                    window.minimize()
-                                    logging.info(" -> ウィンドウを最小化しました。")
-                                else:
-                                    x, y, w, h = self.calculator.get_target_rect(action, window)
+                                try:
+                                    # --- 仮想デスクトップ移動 ---
+                                    target_workspace = action.get("target_workspace")
+                                    if isinstance(target_workspace, int):
+                                        try:
+                                            num_desktops = len(get_virtual_desktops())
+                                            if 1 <= target_workspace <= num_desktops:
+                                                logging.info(f" -> 仮想デスクトップ {target_workspace} に移動します。")
+                                                AppView(hwnd=window._hWnd).move(VirtualDesktop(number=target_workspace))
+                                            else:
+                                                logging.warning(f"指定された仮想デスクトップ {target_workspace} は存在しません (利用可能なデスクトップ数: {num_desktops})。")
+                                        except Exception as e:
+                                            logging.error(f"仮想デスクトップの移動中にエラーが発生しました: {e}", exc_info=True)
+
+                                    # --- ウィンドウ操作 ---
+                                    if action.get("maximize", "").upper() == "ON":
+                                        window.maximize()
+                                        logging.info(" -> ウィンドウを最大化しました。")
+                                    elif action.get("minimize", "").upper() == "ON":
+                                        window.minimize()
+                                        logging.info(" -> ウィンドウを最小化しました。")
+                                    else:
+                                        x, y, w, h = self.calculator.get_target_rect(action, window)
+                                        
+                                        if w != window.width or h != window.height:
+                                            logging.info(f" -> サイズを {w}x{h} に変更します。")
+                                            window.resizeTo(w, h)
+                                        if x != window.left or y != window.top:
+                                            logging.info(f" -> 位置を ({x}, {y}) に移動します。")
+                                            window.moveTo(x, y)
                                     
-                                    if w != window.width or h != window.height:
-                                        logging.info(f" -> サイズを {w}x{h} に変更します。")
-                                        window.resizeTo(w, h)
-                                    if x != window.left or y != window.top:
-                                        logging.info(f" -> 位置を ({x}, {y}) に移動します。")
-                                        window.moveTo(x, y)
+                                    self.processed_windows.add(window._hWnd)
+                                except gw.PyGetWindowException as e:
+                                    logging.warning(f'ウィンドウ "{window.title}" の操作に失敗しました: {e}')
+                                except Exception as e:
+                                    logging.error(f'ルール "{rule_name}" の適用中に予期せぬエラーが発生しました: {e}', exc_info=True)
                                 
-                                self.processed_windows.add(window._hWnd)
-                            except gw.PyGetWindowException as e:
-                                logging.warning(f'ウィンドウ "{window.title}" の操作に失敗しました: {e}')
-                            except Exception as e:
-                                logging.error(f'ルール "{rule_name}" の適用中に予期せぬエラーが発生しました: {e}', exc_info=True)
-                            
-                            break # このウィンドウに対する処理は終了し、次のウィンドウへ
-                
-                # 閉じたウィンドウのハンドルをセットから削除
-                self.processed_windows.intersection_update(current_handles)
+                                break # このウィンドウに対する処理は終了し、次のウィンドウへ
+                    
+                    # 閉じたウィンドウのハンドルをセットから削除
+                    self.processed_windows.intersection_update(current_handles)
 
-            except Exception as e:
-                logging.error(f"ウィンドウ処理のメインループで予期せぬエラーが発生しました: {e}", exc_info=True)
+                except Exception as e:
+                    logging.error(f"ウィンドウ処理のメインループで予期せぬエラーが発生しました: {e}", exc_info=True)
 
             time.sleep(max(0.1, polling_interval_ms / 1000))
 
@@ -374,33 +396,35 @@ class Tray:
 
     def _clear_log_action(self, icon, item):
         """ログファイルをクリアする"""
-        try:
-            # 現在のログレベルを維持してロガーを再セットアップ（これによりファイルが 'w' モードで開かれる）
-            log_level_str = self.window_manager.settings.globals.get("log_level", "INFO")
-            log_level = get_log_level_from_string(log_level_str)
-            setup_logging(level=log_level)
-            logging.info("ログファイルをクリアしました。")
-        except Exception as e:
-            # ロギングが機能しない可能性を考慮し、printでも出力
-            print(f"ログファイルのクリア中にエラーが発生しました: {e}")
-            logging.error(f"ログファイルのクリア中にエラーが発生しました: {e}", exc_info=True)
+        with self.window_manager.lock:
+            try:
+                # 現在のログレベルを維持してロガーを再セットアップ（これによりファイルが 'w' モードで開かれる）
+                log_level_str = self.window_manager.settings.globals.get("log_level", "INFO")
+                log_level = get_log_level_from_string(log_level_str)
+                setup_logging(level=log_level)
+                logging.info("ログファイルをクリアしました。")
+            except Exception as e:
+                # ロギングが機能しない可能性を考慮し、printでも出力
+                print(f"ログファイルのクリア中にエラーが発生しました: {e}")
+                logging.error(f"ログファイルのクリア中にエラーが発生しました: {e}", exc_info=True)
 
     def _toggle_pause_action(self, icon, item):
         """一時停止と再開を切り替える"""
-        self.is_paused = not self.is_paused
-        if self.is_paused:
-            self.window_manager.running_event.clear()
-            self.icon.icon = self.icon_paused
-            logging.info("処理を一時停止しました。")
-        else:
-            self.window_manager.running_event.set()
-            self.icon.icon = self.icon_running
-            logging.info("処理を再開しました。")
-            if self.window_manager.settings.globals.get("apply_on_resume", True):
-                self.window_manager.processed_windows.clear()
-                logging.info("すべてのウィンドウにルールを再適用します。")
+        with self.window_manager.lock:
+            self.is_paused = not self.is_paused
+            if self.is_paused:
+                self.window_manager.running_event.clear()
+                self.icon.icon = self.icon_paused
+                logging.info("処理を一時停止しました。")
             else:
-                logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
+                self.window_manager.running_event.set()
+                self.icon.icon = self.icon_running
+                logging.info("処理を再開しました。")
+                if self.window_manager.settings.globals.get("apply_on_resume", True):
+                    self.window_manager.processed_windows.clear()
+                    logging.info("すべてのウィンドウにルールを再適用します。")
+                else:
+                    logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
 
     def _create_default_image(self, width, height, color1, color2):
         """デフォルトのアイコン画像を生成する"""
@@ -413,38 +437,39 @@ class Tray:
     def _reload_settings_action(self, icon, item):
         """設定ファイルを再読み込みする"""
         logging.info("設定の再読み込みを開始します。")
-        try:
-            # 1. 設定ファイルをリロード
-            self.window_manager.settings.load()
-
-            # 2. モニター情報を再取得
+        with self.window_manager.lock:
             try:
-                monitors = get_monitors()
+                # 1. 設定ファイルをリロード
+                self.window_manager.settings.load()
+
+                # 2. モニター情報を再取得
+                try:
+                    monitors = get_monitors()
+                except Exception as e:
+                    logging.error(f"モニター情報の取得に失敗しました: {e}")
+                    return # モニター情報がなければ続行不可
+
+                # 3. 新しい設定とモニター情報でCalculatorを再生成
+                self.window_manager.calculator = Calculator(monitors, self.window_manager.settings.globals)
+                logging.info(f"{len(monitors)}個のモニター情報を更新しました。")
+
+                # 4. 新しいログレベルを適用
+                log_level_str = self.window_manager.settings.globals.get("log_level", "INFO")
+                log_level = get_log_level_from_string(log_level_str)
+                setup_logging(level=log_level)
+                logging.info(f"ログレベルを「{log_level_str}」に設定しました。")
+
+                # 5. ルール再適用の設定
+                if self.window_manager.settings.globals.get("apply_on_reload", True):
+                    self.window_manager.processed_windows.clear()
+                    logging.info("すべてのウィンドウにルールを再適用します。")
+                else:
+                    logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
+                
+                logging.info("設定の再読み込みが完了しました。")
+
             except Exception as e:
-                logging.error(f"モニター情報の取得に失敗しました: {e}")
-                return # モニター情報がなければ続行不可
-
-            # 3. 新しい設定とモニター情報でCalculatorを再生成
-            self.window_manager.calculator = Calculator(monitors, self.window_manager.settings.globals)
-            logging.info(f"{len(monitors)}個のモニター情報を更新しました。")
-
-            # 4. 新しいログレベルを適用
-            log_level_str = self.window_manager.settings.globals.get("log_level", "INFO")
-            log_level = get_log_level_from_string(log_level_str)
-            setup_logging(level=log_level)
-            logging.info(f"ログレベルを「{log_level_str}」に設定しました。")
-
-            # 5. ルール再適用の設定
-            if self.window_manager.settings.globals.get("apply_on_reload", True):
-                self.window_manager.processed_windows.clear()
-                logging.info("すべてのウィンドウにルールを再適用します。")
-            else:
-                logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
-            
-            logging.info("設定の再読み込みが完了しました。")
-
-        except Exception as e:
-            logging.error(f"設定の再読み込み中に予期せぬエラーが発生しました: {e}", exc_info=True)
+                logging.error(f"設定の再読み込み中に予期せぬエラーが発生しました: {e}", exc_info=True)
 
     def _exit_action(self, icon, item):
         logging.info("アプリケーションを終了します。")

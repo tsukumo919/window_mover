@@ -4,3 +4,4 @@ psutil
 toml
 Pillow
 screeninfo
+pyvda
