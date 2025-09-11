@@ -1,0 +1,112 @@
+#================================================================
+# Window Mover Settings
+#================================================================
+
+# --- 全体設定 ---
+[global]
+# ウィンドウをスキャンするポーリング間隔（ミリ秒単位）。
+# 1000 = 1秒。小さくしすぎるとCPU使用率が上がる可能性があります。
+polling_interval = 1000
+
+  # --- ログ設定 ---
+  # ログファイルに出力するログレベル。 "DEBUG", "INFO", "WARNING", "ERROR" から選択。
+  log_level = "DEBUG"
+
+  # --- 既存ウィンドウへのルール適用タイミング ---
+  # 起動時に既存のウィンドウすべてにルールを適用するか
+  apply_on_startup = true
+  # 設定再読み込み時に既存のウィンドウすべてにルールを適用するか
+  apply_on_reload = true
+  # 一時停止から再開する時に既存のウィンドウすべてにルールを適用するか
+  apply_on_resume = false
+
+  # モニターオフセットの設定
+  [global.monitor_offsets]
+  # モニター個別の設定がない場合に適用されるデフォルトのオフセット
+  default = { top = 0, bottom = 0, left = 0, right = 0 }
+  # モニター1にはタスクバー等を考慮したオフセットを適用(move_to = "MiddleCenter"など9ポイントモード指定の場合)
+  monitor_1 = { top = 0, bottom = 48, left = 0, right = 0 }
+
+#================================================================
+# Rules - ここから下に個別のルールを記述します
+#================================================================
+
+[[rules]]
+  name = "電卓を画面中央に320px x 480pxで表示"
+
+  [rules.condition]
+  title = "電卓"
+
+  [rules.action]
+  anchor = "MiddleCenter"
+  move_to = "MiddleCenter"
+  resize_to = { width = 320, height = 480 } # 数値のみはpx扱い
+
+[[rules]]
+  name = "タイトルなしのメモ帳を正規表現/OR条件で検出し、画面の左上から10px x 10px の位置に320px x 320pxで表示"
+
+  [rules.condition]
+  logic = "OR"
+  conditions = [
+    { title = "regex:^タイトルなし - メモ帳$" },
+    { title = "regex:^無題 - メモ帳$" }
+  ]
+
+  [rules.action]
+  # デフォルトでアンカーはTopLeftのため省略可能
+  # anchor = "TopLeft"
+  # move_toを絶対値で指定の場合は、モニターオフセットは計算から除外する
+  move_to = { x = "10px", y = "10px"}
+  resize_to = { width = "320px", height = "320px"}
+
+[[rules]]
+  name = "ペイントを右下の作業領域に"
+
+  [rules.condition]
+  process = "regex:(mspaint|pbrush)\\.exe"
+
+  [rules.action]
+  anchor = "BottomRight"
+  move_to = "BottomRight"
+  #このルール独自のオフセットを追加
+  offset = { x = -20, y = -20 }
+  target_monitor = 2
+
+[[rules]]
+  name = "ウィンドウの中心を横20%、縦30%の位置に、画面の横80%、縦70%のサイズで表示"
+
+  [rules.condition]
+  title = "SomeApp"
+
+  [rules.action]
+  anchor = "MiddleCenter"
+  move_to = { x = "20%", y = "30%"}
+  # width/heightはw/hで省略表記も可能
+  resize_to = { w = "80%", h = "70%" }
+
+[[rules]]
+  name = "ウィンドウを最大化"
+
+  [rules.condition]
+  title = "MaximizeApp"
+
+  [rules.action]
+  maximize = "ON"
+
+[[rules]]
+  name = "ウィンドウを最小化"
+
+  [rules.condition]
+  title = "MinimizeApp"
+
+  [rules.action]
+  minimize = "ON"
+
+[[rules]]
+  name = "特定のウィンドウをモニター2へ"
+
+  [rules.condition]
+  title = "モニター2へ移動"
+
+  [rules.action]
+  target_monitor = 2

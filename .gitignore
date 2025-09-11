@@ -1,0 +1,50 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtualenv
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Instance Folder
+instance/
+.webassets-cache
+
+# PyInstaller
+#  Usually these files are created by pyinstaller, if you are using pyinstaller
+#  we recommend to create a subdirectory for said files and add that directory
+#  to your .gitignore. For example, if you create a subdirectory called
+#  `pyinstaller_build`, you would add `pyinstaller_build/` to your .gitignore.
+#
+# *.manifest
+# *.spec
+
+# Custom
+log.txt

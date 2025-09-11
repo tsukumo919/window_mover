@@ -1,0 +1,6 @@
+pystray
+pygetwindow
+psutil
+toml
+Pillow
+screeninfo
