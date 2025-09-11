@@ -306,7 +306,7 @@ class WindowManager:
                     current_handles = {w._hWnd for w in all_windows}
 
                     for window in all_windows:
-                        if not (window.visible and window.title and window._hWnd not in self.processed_windows):
+                        if not (window.visible and not window.isMinimized and window.title and window._hWnd not in self.processed_windows):
                             continue
 
                         process_name = self._get_process_name(window._hWnd)
