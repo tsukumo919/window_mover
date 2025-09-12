@@ -185,7 +185,7 @@ class Calculator:
             work_area_height = monitor.height - offset_top - offset_bottom
             logging.debug(f"作業領域: {work_area_width}x{work_area_height} at ({work_area_x},{work_area_y})")
 
-            resize_to = rule_action.get("resize_to", {})
+            resize_to = rule_action.get("resize_to") or {}
             w_val = resize_to.get("width")
             h_val = resize_to.get("height")
             width = self._parse_value(w_val, work_area_width) if w_val is not None else window.width
@@ -291,7 +291,7 @@ class WindowManager:
         """単一の条件をチェックする"""
         title_pattern = condition.get("title")
         process_pattern = condition.get("process")
-        class_pattern = condition.get("class")
+        class_pattern = condition.get("class_name")
 
         if title_pattern:
             try:

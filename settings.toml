@@ -44,8 +44,6 @@
     { process = "StartMenuExperienceHost.exe" }, # スタートメニュー
     { process = "Widgets.exe" },             # ウィジェット
     { process = "LockApp.exe" },             # ロック画面
-    { title = "電卓" },
-
     # --- クラス名で無視 ---
     { class = "VirtualDesktopHotkeySwitcher" } # 仮想デスクトップスイッチャー
     { class = "Shell_TrayWnd" }              # タスクバー
