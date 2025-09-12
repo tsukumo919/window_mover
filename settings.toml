@@ -26,6 +26,30 @@
   monitor_1 = { top = 0, bottom = 48, left = 0, right = 0 }
 
 #================================================================
+# Ignores - ここに記述された条件に一致するウィンドウは処理対象外になります
+#================================================================
+[[ignores]]
+  name = "無視リスト"
+  logic = "OR"
+  conditions = [
+    # --- プロセス名で無視 ---
+    { process = "SystemSettings.exe" },      # Windows 設定
+    { process = "TextInputHost.exe" },       # テキスト入力UI
+    { process = "SearchHost.exe" },          # 検索UI
+    { process = "SearchApp.exe" },           # 検索UI
+    { process = "ShellExperienceHost.exe" }, # シェルUI
+    { process = "StartMenuExperienceHost.exe" }, # スタートメニュー
+    { process = "Widgets.exe" },             # ウィジェット
+    { process = "LockApp.exe" },             # ロック画面
+    { title = "電卓" },
+
+    # --- クラス名で無視 ---
+    { class = "VirtualDesktopHotkeySwitcher" } # 仮想デスクトップスイッチャー
+    { class = "Shell_TrayWnd" }              # タスクバー
+    
+  ]
+
+#================================================================
 # Rules - ここから下に個別のルールを記述します
 #================================================================
 
@@ -70,6 +94,17 @@
   #このルール独自のオフセットを追加
   offset = { x = -20, y = -20 }
   target_monitor = 2
+
+[[rules]]
+  name = "Crescent Eveを画面中央に"
+
+  [rules.condition]
+  class = "CrescentEveMainWindowClass"
+
+  [rules.action]
+  anchor = "MiddleCenter"
+  move_to = "MiddleCenter"
+  resize_to = { w = 640, h = 860 }
 
 [[rules]]
   name = "ウィンドウの中心を横20%、縦30%の位置に、画面の横80%、縦70%のサイズで表示"

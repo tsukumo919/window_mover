@@ -25,8 +25,7 @@ ANCHOR_POINTS = {
     "MiddleLeft": (0.0, 0.5), "MiddleCenter": (0.5, 0.5), "MiddleRight": (1.0, 0.5),
     "BottomLeft": (0.0, 1.0), "BottomCenter": (0.5, 1.0), "BottomRight": (1.0, 1.0)
 }
-# WinEventHookで無視するプロセスのリスト
-IGNORED_PROCESSES = {"SystemSettings.exe", "TextInputHost.exe", "SearchHost.exe", "SearchApp.exe", "ShellExperienceHost.exe", "StartMenuExperienceHost.exe", "Widgets.exe", "LockApp.exe"}
+
 
 # --- ログレベル変換 ---
 def get_log_level_from_string(level_str: str) -> int:
@@ -56,6 +55,7 @@ class Settings:
         self.filepath = filepath
         self.globals = {}
         self.rules = []
+        self.ignores = []
         self.load()
 
     def load(self):
@@ -65,7 +65,8 @@ class Settings:
                 data = toml.load(f)
             self.globals = data.get("global", {})
             self.rules = data.get("rules", [])
-            logging.info(f"設定ファイルを読み込みました。Global: {len(self.globals)}項目, Rules: {len(self.rules)}個")
+            self.ignores = data.get("ignores", [])
+            logging.info(f"設定ファイルを読み込みました。Global: {len(self.globals)}項目, Ignores: {len(self.ignores)}個, Rules: {len(self.rules)}個")
         except FileNotFoundError:
             logging.error(f"設定ファイル '{self.filepath}' が見つかりません。")
         except toml.TomlDecodeError as e:
@@ -317,9 +318,13 @@ class WindowManager:
 
             process_name = self._get_process_name(hwnd)
             logging.debug(f"イベント受信: タイトル='{window.title}', プロセス='{process_name}', クラス='{class_name}'")
-            if process_name in IGNORED_PROCESSES:
-                logging.info(f"プロセス '{process_name}' (ウィンドウタイトル: '{window.title}') は無視リストに含まれているため、処理をスキップします。")
-                return
+
+            # 新しい無視ルールをチェック
+            for ignore_rule in self.settings.ignores:
+                if self._check_rule_conditions(window, process_name, class_name, ignore_rule):
+                    ignore_name = ignore_rule.get("name", "無名無視ルール")
+                    logging.info(f"無視ルール '{ignore_name}' に一致したため、ウィンドウ '{window.title}' の処理をスキップします。")
+                    return
 
             for rule in self.settings.rules:
                 if self._check_rule_conditions(window, process_name, class_name, rule.get("condition", {})):
