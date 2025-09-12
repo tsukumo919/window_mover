@@ -5,3 +5,4 @@ toml
 Pillow
 screeninfo
 pyvda
+pywin32

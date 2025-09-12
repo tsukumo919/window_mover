@@ -1,4 +1,3 @@
-
 import asyncio
 import threading
 import time
@@ -13,6 +12,9 @@ import ctypes
 import re
 from screeninfo import get_monitors
 from pyvda import AppView, VirtualDesktop, get_virtual_desktops
+import win32gui
+import win32con
+import queue
 
 # --- 定数 ---
 SETTINGS_FILE = "settings.toml"
@@ -22,6 +24,8 @@ ANCHOR_POINTS = {
     "MiddleLeft": (0.0, 0.5), "MiddleCenter": (0.5, 0.5), "MiddleRight": (1.0, 0.5),
     "BottomLeft": (0.0, 1.0), "BottomCenter": (0.5, 1.0), "BottomRight": (1.0, 1.0)
 }
+# WinEventHookで無視するプロセスのリスト
+IGNORED_PROCESSES = {"ApplicationFrameHost.exe", "SystemSettings.exe", "TextInputHost.exe"}
 
 # --- ログレベル変換 ---
 def get_log_level_from_string(level_str: str) -> int:
@@ -31,20 +35,17 @@ def get_log_level_from_string(level_str: str) -> int:
 # --- ロギング設定 ---
 def setup_logging(level: int = logging.INFO):
     """ロギングの基本設定を行う"""
-    # 既存のハンドラをすべて削除し、設定の重複を防ぐ
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
     
-    # 新しい設定で再構成
     logging.basicConfig(
         level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
         handlers=[
             logging.FileHandler(LOG_FILE, encoding='utf-8', mode='w'),
             logging.StreamHandler()
         ]
     )
-    # ライブラリのデバッグログを抑制
     logging.getLogger("pyvda").setLevel(logging.INFO)
     logging.getLogger("PIL").setLevel(logging.INFO)
 
@@ -98,7 +99,6 @@ class Calculator:
     def get_target_rect(self, rule_action, window):
         """ルールとウィンドウ情報に基づき、最終的な座標とサイズ (x, y, w, h) を計算する"""
         try:
-            # 1. ターゲットモニターを決定
             monitor = None
             target_monitor_num = rule_action.get("target_monitor")
             if target_monitor_num is not None:
@@ -116,7 +116,6 @@ class Calculator:
             monitor_id = f"monitor_{monitor_idx + 1}"
             logging.debug(f"対象モニター: {monitor_id} ({monitor.width}x{monitor.height} at ({monitor.x},{monitor.y}))")
 
-            # 2. モニターの作業領域を計算
             offsets = self.globals.get("monitor_offsets", {})
             g_offset = {}
             if not is_absolute_move:
@@ -134,7 +133,6 @@ class Calculator:
             work_area_height = monitor.height - offset_top - offset_bottom
             logging.debug(f"作業領域: {work_area_width}x{work_area_height} at ({work_area_x},{work_area_y})")
 
-            # 3. ウィンドウサイズを計算
             resize_to = rule_action.get("resize_to", {})
             w_val = resize_to.get("w", resize_to.get("width"))
             h_val = resize_to.get("h", resize_to.get("height"))
@@ -145,20 +143,19 @@ class Calculator:
                 width = window.width if width is None else width
                 height = window.height if height is None else height
 
-            # 4. ターゲット座標を計算
             move_to = rule_action.get("move_to")
             anchor_name = rule_action.get("anchor", "TopLeft")
             anchor_x_ratio, anchor_y_ratio = ANCHOR_POINTS.get(anchor_name, (0.0, 0.0))
             logging.debug(f"ウィンドウのアンカー: {anchor_name} ({anchor_x_ratio}, {anchor_y_ratio})")
 
             base_x, base_y = None, None
-            if isinstance(move_to, str): # アンカー指定
+            if isinstance(move_to, str):
                 target_anchor_name = move_to
                 target_x_ratio, target_y_ratio = ANCHOR_POINTS.get(target_anchor_name, (0.0, 0.0))
                 base_x = work_area_x + int(work_area_width * target_x_ratio)
                 base_y = work_area_y + int(work_area_height * target_y_ratio)
                 logging.debug(f"移動先アンカー '{target_anchor_name}' -> ベース座標 ({base_x}, {base_y})")
-            elif isinstance(move_to, dict): # 絶対/相対座標指定
+            elif isinstance(move_to, dict):
                 abs_x_val = move_to.get("x")
                 abs_y_val = move_to.get("y")
                 abs_x = self._parse_value(abs_x_val, monitor.width)
@@ -174,12 +171,10 @@ class Calculator:
             final_x = base_x if base_x is not None else window.left
             final_y = base_y if base_y is not None else window.top
 
-            # 5. ウィンドウ自体のアンカーを適用
             final_x -= int(width * anchor_x_ratio)
             final_y -= int(height * anchor_y_ratio)
             logging.debug(f"ウィンドウアンカー適用後 -> ({final_x}, {final_y})")
 
-            # 6. ルール個別のオフセットを適用
             rule_offset = rule_action.get("offset", {})
             offset_x = rule_offset.get("x", 0)
             offset_y = rule_offset.get("y", 0)
@@ -192,7 +187,6 @@ class Calculator:
         except Exception as e:
             logging.error(f"座標計算中に予期せぬエラーが発生しました: {e}", exc_info=True)
             return window.left, window.top, window.width, window.height
-
 
     def get_window_monitor(self, window):
         """ウィンドウの中心が含まれるモニターを返す"""
@@ -211,8 +205,9 @@ class Calculator:
 
 # --- ウィンドウ処理 ---
 class WindowManager:
-    def __init__(self, settings):
+    def __init__(self, settings, loop):
         self.settings = settings
+        self.loop = loop
         try:
             monitors = get_monitors()
         except Exception as e:
@@ -220,17 +215,8 @@ class WindowManager:
             raise
         self.calculator = Calculator(monitors, self.settings.globals)
         self.processed_windows = set()
-        self.running_event = threading.Event()
-        self.running_event.set() # 初期状態は実行中
+        self.is_paused = False
         self.lock = threading.Lock()
-
-        if not self.settings.globals.get("apply_on_startup", True):
-            logging.info("起動時のルール適用はスキップします（既存のウィンドウは対象外）。")
-            try:
-                # 既存の可視ウィンドウをすべて処理済みにする
-                self.processed_windows.update(w._hWnd for w in gw.getAllWindows() if w.visible)
-            except Exception as e:
-                logging.error(f"起動時の既存ウィンドウ取得中にエラーが発生しました: {e}", exc_info=True)
 
     def _get_process_name(self, hwnd):
         """ウィンドウハンドルからプロセス名を取得する"""
@@ -238,11 +224,9 @@ class WindowManager:
             pid = ctypes.c_ulong()
             ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if pid.value == 0:
-                logging.debug(f"PIDが0のため、プロセス名を取得できませんでした (HWND: {hwnd})。")
                 return None
             return psutil.Process(pid.value).name()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
-            logging.warning(f"プロセス名の取得に失敗しました (PID: {pid.value}): {e}")
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             return None
         except Exception as e:
             logging.error(f"プロセス名取得中に予期せぬエラー (PID: {pid.value}): {e}", exc_info=True)
@@ -294,18 +278,56 @@ class WindowManager:
             logging.error(f"ルール条件の評価中にエラーが発生しました: {e}", exc_info=True)
             return False
 
-    def run(self):
-        """
-        スレッドのエントリポイント。
-        このメソッド内で非同期イベントループを開始し、ウィンドウ監視のメインループを実行する。
-        """
+    def handle_window_event(self, hwnd):
+        """WinEventHookからのコールバック。ウィンドウを処理キューに追加する"""
+        with self.lock:
+            if self.is_paused:
+                return
+            # 既に処理済みのウィンドウは無視
+            if hwnd in self.processed_windows:
+                return
+        
         try:
-            # スレッド内で新しいイベントループを作成して実行
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._monitor_windows_async())
+            # イベント発生直後はウィンドウ情報が不完全なことがあるため、少し待つ
+            time.sleep(0.1)
+            
+            window = gw.PyGetWindow(hwnd)
+            if not (window.visible and not window.isMinimized and window.title):
+                return
+
+            process_name = self._get_process_name(hwnd)
+            if process_name in IGNORED_PROCESSES:
+                return
+
+            for rule in self.settings.rules:
+                if self._check_rule_conditions(window, process_name, rule.get("condition", {})):
+                    with self.lock:
+                        if hwnd in self.processed_windows: # ダブルチェック
+                            continue
+                        self.processed_windows.add(hwnd)
+                    
+                    # 非同期タスクをスレッドセーフに呼び出す
+                    asyncio.run_coroutine_threadsafe(self._apply_rule_async(rule, window), self.loop)
+                    break
+        except gw.PyGetWindowException:
+            # ウィンドウが既に閉じられている場合など
+            pass
         except Exception as e:
-            logging.critical(f"非同期ウィンドウ監視ループで致命的なエラーが発生しました: {e}", exc_info=True)
+            logging.error(f"ウィンドウイベント処理中にエラーが発生しました (HWND: {hwnd}): {e}", exc_info=True)
+
+    def process_existing_windows(self):
+        """起動時に既存のウィンドウをすべて処理する"""
+        if not self.settings.globals.get("apply_on_startup", True):
+            logging.info("起動時のルール適用はスキップします。")
+            return
+        
+        logging.info("既存のウィンドウにルールを適用します...")
+        try:
+            for window in gw.getAllWindows():
+                if window.visible and not window.isMinimized and window.title:
+                    self.handle_window_event(window._hWnd)
+        except Exception as e:
+            logging.error(f"既存ウィンドウの処理中にエラー: {e}", exc_info=True)
 
     async def _apply_rule_async(self, rule, window):
         """非同期で単一のルールをウィンドウに適用する"""
@@ -314,25 +336,22 @@ class WindowManager:
         logging.info(f'非同期タスク開始: ルール "{rule_name}" を "{window.title}" に適用します。')
 
         try:
-            # --- 遅延処理 ---
             delay_ms = action.get("execution_delay")
             if isinstance(delay_ms, int) and delay_ms > 0:
                 logging.info(f" -> {delay_ms}ms の遅延を開始します。")
                 await asyncio.sleep(delay_ms / 1000)
                 logging.info(f" -> {delay_ms}ms の遅延が完了しました。")
 
-            # 遅延後にウィンドウがまだ有効か確認
             if not window.visible or window.isMinimized:
                 logging.warning(f'遅延後、ウィンドウ "{window.title}" が非表示または最小化されたため、処理を中断します。')
+                self._discard_window(window._hWnd)
                 return
 
-            # ウィンドウ操作はロックで保護する
             with self.lock:
-                # 再度ウィンドウの状態をチェック
                 if not window.visible or window.isMinimized:
+                    self._discard_window(window._hWnd)
                     return
 
-                # --- 仮想デスクトップ移動 ---
                 target_workspace = action.get("target_workspace")
                 if isinstance(target_workspace, int):
                     try:
@@ -345,7 +364,6 @@ class WindowManager:
                     except Exception as e:
                         logging.error(f"仮想デスクトップの移動中にエラーが発生しました: {e}", exc_info=True)
 
-                # --- ウィンドウ操作 ---
                 if action.get("maximize", "").upper() == "ON":
                     window.maximize()
                     logging.info(" -> ウィンドウを最大化しました。")
@@ -355,7 +373,6 @@ class WindowManager:
                 else:
                     x, y, w, h = self.calculator.get_target_rect(action, window)
                     
-                    # PyGetWindowのプロパティアクセスは遅い可能性があるので、一度だけアクセスする
                     current_left, current_top, current_width, current_height = window.left, window.top, window.width, window.height
                     
                     if w != current_width or h != current_height:
@@ -367,52 +384,81 @@ class WindowManager:
 
         except gw.PyGetWindowException as e:
             logging.warning(f'ウィンドウ "{window.title}" の操作に失敗しました: {e}')
-            with self.lock:
-                self.processed_windows.discard(window._hWnd)
+            self._discard_window(window._hWnd)
         except Exception as e:
-            logging.error(f'ルール "{rule_name}" の適用中に予期せぬエラーが発生しました: {e}', exc_info=True)
-            with self.lock:
-                self.processed_windows.discard(window._hWnd)
+            logging.error(f'ルール "{rule_name}" の適用中に予期せぬエラーが発生しました: {e}", exc_info=True)
+            self._discard_window(window._hWnd)
 
-    async def _monitor_windows_async(self):
-        """ウィンドウを定期的に監視し、ルールを適用する非同期メインループ"""
-        while True:
-            if not self.running_event.is_set():
-                await asyncio.sleep(0.5) # 一時停止中は少し長めに待つ
-                continue
+    def _discard_window(self, hwnd):
+        """処理済みセットからウィンドウを安全に削除する"""
+        with self.lock:
+            self.processed_windows.discard(hwnd)
 
-            polling_interval_ms = self.settings.globals.get("polling_interval", 1000)
+# --- Win32 イベントフック ---
+class WinEventHook(threading.Thread):
+    def __init__(self, callback):
+        super().__init__(name="WinEventHookThread", daemon=True)
+        self.callback = callback
+        self.hook = None
+        self.running = False
+
+    def run(self):
+        """イベントフックを開始し、メッセージループに入る"""
+        self.running = True
+        try:
+            # イベントフックを設定
+            # EVENT_OBJECT_CREATE: ウィンドウ作成時
+            # EVENT_OBJECT_SHOW: ウィンドウ表示時
+            self.hook = win32gui.SetWinEventHook(
+                win32con.EVENT_OBJECT_CREATE,
+                win32con.EVENT_OBJECT_SHOW,
+                0, self.event_proc, 0, 0, win32con.WINEVENT_OUTOFCONTEXT
+            )
+            if self.hook:
+                logging.info("Win32 イベントフックを開始しました。")
+                win32gui.PumpMessages()
+            else:
+                logging.error("Win32 イベントフックの開始に失敗しました。")
+        except Exception as e:
+            logging.critical(f"WinEventフックスレッドで致命的なエラー: {e}", exc_info=True)
+        finally:
+            logging.info("WinEventフックスレッドが終了しました。")
+
+    def stop(self):
+        """イベントフックを解除し、メッセージループを終了する"""
+        if self.hook:
+            win32gui.UnhookWinEvent(self.hook)
+            self.hook = None
+            logging.info("Win32 イベントフックを解除しました。")
+        # メッセージループを終了させるためにダミーメッセージをポスト
+        ctypes.windll.user32.PostThreadMessageW(self.ident, win32con.WM_QUIT, 0, 0)
+        self.running = False
+
+    def event_proc(self, hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
+        """イベントコールバック関数"""
+        # 自分自身のスレッドIDとイベントスレッドIDを比較し、再帰呼び出しを防ぐ
+        if dwEventThread == self.ident:
+            return
             
-            try:
-                all_windows = gw.getAllWindows()
-                
-                with self.lock:
-                    current_handles = {w._hWnd for w in all_windows}
+        # アクセシビリティ関連のオブジェクトや子ウィンドウは無視
+        if idObject != win32con.OBJID_WINDOW or idChild != 0:
+            return
+        
+        # ウィンドウハンドルが無効、またはトップレベルウィンドウでない場合は無視
+        if not hwnd or not win32gui.IsWindow(hwnd) or win32gui.GetParent(hwnd) != 0:
+            return
 
-                    for window in all_windows:
-                        if not (window.visible and not window.isMinimized and window.title and window._hWnd not in self.processed_windows):
-                            continue
-
-                        process_name = self._get_process_name(window._hWnd)
-                        
-                        for rule in self.settings.rules:
-                            if self._check_rule_conditions(window, process_name, rule.get("condition", {})):
-                                self.processed_windows.add(window._hWnd)
-                                asyncio.create_task(self._apply_rule_async(rule, window))
-                                break 
-                    
-                    self.processed_windows.intersection_update(current_handles)
-
-            except Exception as e:
-                logging.error(f"ウィンドウ処理のメインループで予期せぬエラーが発生しました: {e}", exc_info=True)
-
-            await asyncio.sleep(max(0.1, polling_interval_ms / 1000))
+        try:
+            # コールバックを呼び出してウィンドウ処理を依頼
+            self.callback(hwnd)
+        except Exception as e:
+            logging.error(f"イベント処理コールバックでエラー (HWND: {hwnd}): {e}", exc_info=True)
 
 # --- システムトレイ ---
 class Tray:
-    def __init__(self, window_manager):
+    def __init__(self, window_manager, win_event_hook):
         self.window_manager = window_manager
-        self.is_paused = False
+        self.win_event_hook = win_event_hook
 
         try:
             self.icon_running = Image.open("window_mover.ico")
@@ -428,7 +474,7 @@ class Tray:
 
         menu = pystray.Menu(
             pystray.MenuItem(
-                lambda text: "再開" if self.is_paused else "一時停止",
+                lambda text: "再開" if self.window_manager.is_paused else "一時停止",
                 self._toggle_pause_action
             ),
             pystray.MenuItem("設定を再読み込み", self._reload_settings_action),
@@ -442,31 +488,28 @@ class Tray:
         """ログファイルをクリアする"""
         with self.window_manager.lock:
             try:
-                # 現在のログレベルを維持してロガーを再セットアップ（これによりファイルが 'w' モードで開かれる）
                 log_level_str = self.window_manager.settings.globals.get("log_level", "INFO")
                 log_level = get_log_level_from_string(log_level_str)
                 setup_logging(level=log_level)
                 logging.info("ログファイルをクリアしました。")
             except Exception as e:
-                # ロギングが機能しない可能性を考慮し、printでも出力
                 print(f"ログファイルのクリア中にエラーが発生しました: {e}")
                 logging.error(f"ログファイルのクリア中にエラーが発生しました: {e}", exc_info=True)
 
     def _toggle_pause_action(self, icon, item):
         """一時停止と再開を切り替える"""
         with self.window_manager.lock:
-            self.is_paused = not self.is_paused
-            if self.is_paused:
-                self.window_manager.running_event.clear()
+            self.window_manager.is_paused = not self.window_manager.is_paused
+            if self.window_manager.is_paused:
                 self.icon.icon = self.icon_paused
                 logging.info("処理を一時停止しました。")
             else:
-                self.window_manager.running_event.set()
                 self.icon.icon = self.icon_running
                 logging.info("処理を再開しました。")
                 if self.window_manager.settings.globals.get("apply_on_resume", True):
                     self.window_manager.processed_windows.clear()
                     logging.info("すべてのウィンドウにルールを再適用します。")
+                    self.window_manager.process_existing_windows()
                 else:
                     logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
 
@@ -483,30 +526,25 @@ class Tray:
         logging.info("設定の再読み込みを開始します。")
         with self.window_manager.lock:
             try:
-                # 1. 設定ファイルをリロード
                 self.window_manager.settings.load()
-
-                # 2. モニター情報を再取得
                 try:
                     monitors = get_monitors()
                 except Exception as e:
                     logging.error(f"モニター情報の取得に失敗しました: {e}")
-                    return # モニター情報がなければ続行不可
+                    return
 
-                # 3. 新しい設定とモニター情報でCalculatorを再生成
                 self.window_manager.calculator = Calculator(monitors, self.window_manager.settings.globals)
                 logging.info(f"{len(monitors)}個のモニター情報を更新しました。")
 
-                # 4. 新しいログレベルを適用
                 log_level_str = self.window_manager.settings.globals.get("log_level", "INFO")
                 log_level = get_log_level_from_string(log_level_str)
                 setup_logging(level=log_level)
                 logging.info(f"ログレベルを「{log_level_str}」に設定しました。")
 
-                # 5. ルール再適用の設定
                 if self.window_manager.settings.globals.get("apply_on_reload", True):
                     self.window_manager.processed_windows.clear()
                     logging.info("すべてのウィンドウにルールを再適用します。")
+                    self.window_manager.process_existing_windows()
                 else:
                     logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
                 
@@ -517,39 +555,71 @@ class Tray:
 
     def _exit_action(self, icon, item):
         logging.info("アプリケーションを終了します。")
+        self.win_event_hook.stop()
         icon.stop()
 
     def run(self):
         self.icon.run()
 
-# --- メイン処理 ---
-if __name__ == "__main__":
-    # 起動時にまずデフォルトレベルでロガーを初期化
-    # これにより、設定ファイル読み込み前のエラーも記録できる
-    setup_logging()
+# --- 非同期処理スレッド ---
+class AsyncWorker(threading.Thread):
+    def __init__(self):
+        super().__init__(name="AsyncWorkerThread", daemon=True)
+        self.loop = asyncio.new_event_loop()
 
+    def run(self):
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_forever()
+        finally:
+            self.loop.close()
+            logging.info("非同期ワーカースレッドが終了しました。")
+
+    def stop(self):
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+# --- メイン処理 ---
+def main():
+    setup_logging()
+    
+    async_worker = None
+    win_event_hook = None
+    
     try:
         settings = Settings(SETTINGS_FILE)
-        
-        # 設定ファイルで指定されたレベルでロガーを再セットアップ
         log_level_str = settings.globals.get("log_level", "INFO")
         log_level = get_log_level_from_string(log_level_str)
         setup_logging(level=log_level)
         logging.info(f"ログレベルを「{log_level_str}」に設定しました。")
 
-
         logging.info("アプリケーションを開始します。")
 
-        window_manager = WindowManager(settings)
-        
-        monitor_thread = threading.Thread(target=window_manager.run, daemon=True)
-        monitor_thread.start()
-        logging.info("ウィンドウの監視を開始しました。")
+        # 非同期処理用のワーカースレッドを開始
+        async_worker = AsyncWorker()
+        async_worker.start()
 
-        tray = Tray(window_manager)
-        tray.run()
+        window_manager = WindowManager(settings, async_worker.loop)
+        
+        # Win32イベントフックを開始
+        win_event_hook = WinEventHook(window_manager.handle_window_event)
+        win_event_hook.start()
+        
+        # 起動時のウィンドウ処理
+        # 少し待ってから実行しないと、イベントフックと競合する可能性がある
+        async_worker.loop.call_later(1, window_manager.process_existing_windows)
+
+        tray = Tray(window_manager, win_event_hook)
+        tray.run() # これはブロッキング呼び出し
 
     except Exception as e:
         logging.critical(f"アプリケーションの起動中に致命的なエラーが発生しました: {e}", exc_info=True)
     finally:
+        logging.info("アプリケーションのシャットダウン処理を開始します。")
+        if win_event_hook and win_event_hook.is_alive():
+            win_event_hook.stop()
+        if async_worker and async_worker.is_alive():
+            async_worker.stop()
         logging.info("アプリケーションが終了しました。")
+
+if __name__ == "__main__":
+    main()
