@@ -324,6 +324,8 @@ class WindowManager:
                 if self._check_rule_conditions(window, process_name, class_name, ignore_rule):
                     ignore_name = ignore_rule.get("name", "無名無視ルール")
                     logging.info(f"無視ルール '{ignore_name}' に一致したため、ウィンドウ '{window.title}' の処理をスキップします。")
+                    with self.lock:
+                        self.processed_windows.add(hwnd)
                     return
 
             for rule in self.settings.rules:
@@ -550,15 +552,13 @@ class Tray:
     def _reload_settings_action(self, icon, item):
         """設定ファイルを再読み込みする"""
         logging.info("設定の再読み込みを開始します。")
-        with self.window_manager.lock:
-            try:
+        
+        apply_on_reload_flag = False
+        try:
+            # ロック内で設定の読み込みと適用を完結させる
+            with self.window_manager.lock:
                 self.window_manager.settings.load()
-                try:
-                    monitors = get_monitors()
-                except Exception as e:
-                    logging.error(f"モニター情報の取得に失敗しました: {e}")
-                    return
-
+                monitors = get_monitors()
                 self.window_manager.calculator = Calculator(monitors, self.window_manager.settings.globals)
                 logging.info(f"{len(monitors)}個のモニター情報を更新しました。")
 
@@ -566,18 +566,24 @@ class Tray:
                 log_level = get_log_level_from_string(log_level_str)
                 setup_logging(level=log_level)
                 logging.info(f"ログレベルを「{log_level_str}」に設定しました。")
-
-                if self.window_manager.settings.globals.get("apply_on_reload", True):
-                    self.window_manager.processed_windows.clear()
-                    logging.info("すべてのウィンドウにルールを再適用します。")
-                    self.window_manager.process_existing_windows()
-                else:
-                    logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
                 
-                logging.info("設定の再読み込みが完了しました。")
+                # 後で実行するためにフラグを保持
+                apply_on_reload_flag = self.window_manager.settings.globals.get("apply_on_reload", True)
 
-            except Exception as e:
-                logging.error(f"設定の再読み込み中に予期せぬエラーが発生しました: {e}", exc_info=True)
+        except Exception as e:
+            logging.error(f"設定の再読み込み中に予期せぬエラーが発生しました: {e}", exc_info=True)
+            return # エラーが発生した場合はここで終了
+
+        # ロックの外でウィンドウ処理を実行する
+        if apply_on_reload_flag:
+            logging.info("すべてのウィンドウにルールを再適用します。")
+            self.window_manager.processed_windows.clear()
+            # 別のスレッドで実行することで、UIのフリーズを防ぐ
+            threading.Thread(target=self.window_manager.process_existing_windows, daemon=True).start()
+        else:
+            logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
+        
+        logging.info("設定の再読み込みが完了しました。")
 
     def _exit_action(self, icon, item):
         logging.info("アプリケーションを終了します。")
@@ -631,8 +637,11 @@ def main():
         win_event_hook.start()
         
         # 起動時のウィンドウ処理
-        # 少し待ってから実行しないと、イベントフックと競合する可能性がある
-        async_worker.loop.call_later(1, window_manager.process_existing_windows)
+        def startup_task():
+            time.sleep(1) # イベントフックとの競合を避けるための待機
+            window_manager.process_existing_windows()
+        
+        threading.Thread(target=startup_task, daemon=True).start()
 
         tray = Tray(window_manager, win_event_hook)
         tray.run() # これはブロッキング呼び出し
