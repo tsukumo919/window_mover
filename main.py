@@ -233,11 +233,12 @@ class WindowManager:
             logging.error(f"プロセス名取得中に予期せぬエラー (PID: {pid.value}): {e}", exc_info=True)
             return None
 
-    def _check_single_condition(self, window, process_name, condition):
+    def _check_single_condition(self, window, process_name, class_name, condition):
         """単一の条件をチェックする"""
         title_pattern = condition.get("title")
         process_pattern = condition.get("process")
-        
+        class_pattern = condition.get("class")
+
         if title_pattern:
             try:
                 if title_pattern.startswith("regex:"):
@@ -261,20 +262,33 @@ class WindowManager:
             except re.error as e:
                 logging.warning(f'プロセス条件の正規表現パターン "{pattern}" が不正です: {e}')
                 return False
+        
+        if class_pattern and class_name:
+            try:
+                if class_pattern.startswith("regex:"):
+                    pattern = class_pattern.replace("regex:", "", 1)
+                    if re.search(pattern, class_name, re.IGNORECASE if not condition.get("case_sensitive") else 0):
+                        return True
+                elif class_pattern.lower() in class_name.lower():
+                    return True
+            except re.error as e:
+                logging.warning(f'クラス条件の正規表現パターン "{pattern}" が不正です: {e}')
+                return False
+
         return False
 
-    def _check_rule_conditions(self, window, process_name, rule_condition):
+    def _check_rule_conditions(self, window, process_name, class_name, rule_condition):
         """ルールの条件全体（AND/OR）をチェックする"""
         conditions = rule_condition.get("conditions")
         if not conditions:
-            return self._check_single_condition(window, process_name, rule_condition)
+            return self._check_single_condition(window, process_name, class_name, rule_condition)
         
         logic = rule_condition.get("logic", "AND").upper()
         try:
             if logic == "OR":
-                return any(self._check_single_condition(window, process_name, c) for c in conditions)
+                return any(self._check_single_condition(window, process_name, class_name, c) for c in conditions)
             else: # AND
-                return all(self._check_single_condition(window, process_name, c) for c in conditions)
+                return all(self._check_single_condition(window, process_name, class_name, c) for c in conditions)
         except Exception as e:
             logging.error(f"ルール条件の評価中にエラーが発生しました: {e}", exc_info=True)
             return False
@@ -296,14 +310,19 @@ class WindowManager:
             if not (window.visible and not window.isMinimized and window.title):
                 return
 
+            try:
+                class_name = win32gui.GetClassName(hwnd)
+            except win32gui.error:
+                class_name = None # ウィンドウが既に存在しない場合など
+
             process_name = self._get_process_name(hwnd)
-            logging.debug(f"イベント受信: タイトル='{window.title}', プロセス='{process_name}'")
+            logging.debug(f"イベント受信: タイトル='{window.title}', プロセス='{process_name}', クラス='{class_name}'")
             if process_name in IGNORED_PROCESSES:
                 logging.info(f"プロセス '{process_name}' (ウィンドウタイトル: '{window.title}') は無視リストに含まれているため、処理をスキップします。")
                 return
 
             for rule in self.settings.rules:
-                if self._check_rule_conditions(window, process_name, rule.get("condition", {})):
+                if self._check_rule_conditions(window, process_name, class_name, rule.get("condition", {})):
                     with self.lock:
                         if hwnd in self.processed_windows: # ダブルチェック
                             continue
