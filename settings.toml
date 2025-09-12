@@ -43,7 +43,7 @@ polling_interval = 1000
   resize_to = { width = 320, height = 480 } # 数値のみはpx扱い
 
 [[rules]]
-  name = "タイトルなしのメモ帳を正規表現/OR条件で検出し、画面の左上から10px x 10px の位置に320px x 720pxで表示"
+  name = "タイトルなしのメモ帳を正規表現/OR条件で検出し、画面の左上から10px x 10px の位置に320px x 720pxで表示。3秒後に処理"
 
   [rules.condition]
   logic = "OR"
@@ -57,7 +57,8 @@ polling_interval = 1000
   # anchor = "TopLeft"
   # move_toを絶対値で指定の場合は、モニターオフセットは計算から除外する
   move_to = { x = "10px", y = "10px"}
-  resize_to = { width = "320px", height = "720px"}
+  resize_to = { width = "480px", height = "720px"}
+  execution_delay = 3000 # 3000ms = 3秒の実行遅延
 
 [[rules]]
   name = "ペイントを右下の作業領域に"

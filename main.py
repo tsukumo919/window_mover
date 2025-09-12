@@ -1,4 +1,5 @@
 
+import asyncio
 import threading
 import time
 import logging
@@ -294,15 +295,98 @@ class WindowManager:
             return False
 
     def run(self):
-        """ウィンドウを定期的に監視し、ルールを適用するメインループ"""
-        polling_interval_ms = self.settings.globals.get("polling_interval", 1000)
-        while True:
-            self.running_event.wait() # イベントがクリアされるとここでブロック
-            
+        """
+        スレッドのエントリポイント。
+        このメソッド内で非同期イベントループを開始し、ウィンドウ監視のメインループを実行する。
+        """
+        try:
+            # スレッド内で新しいイベントループを作成して実行
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._monitor_windows_async())
+        except Exception as e:
+            logging.critical(f"非同期ウィンドウ監視ループで致命的なエラーが発生しました: {e}", exc_info=True)
+
+    async def _apply_rule_async(self, rule, window):
+        """非同期で単一のルールをウィンドウに適用する"""
+        rule_name = rule.get("name", "無名ルール")
+        action = rule.get("action", {})
+        logging.info(f'非同期タスク開始: ルール "{rule_name}" を "{window.title}" に適用します。')
+
+        try:
+            # --- 遅延処理 ---
+            delay_ms = action.get("execution_delay")
+            if isinstance(delay_ms, int) and delay_ms > 0:
+                logging.info(f" -> {delay_ms}ms の遅延を開始します。")
+                await asyncio.sleep(delay_ms / 1000)
+                logging.info(f" -> {delay_ms}ms の遅延が完了しました。")
+
+            # 遅延後にウィンドウがまだ有効か確認
+            if not window.visible or window.isMinimized:
+                logging.warning(f'遅延後、ウィンドウ "{window.title}" が非表示または最小化されたため、処理を中断します。')
+                return
+
+            # ウィンドウ操作はロックで保護する
             with self.lock:
-                polling_interval_ms = self.settings.globals.get("polling_interval", 1000)
-                try:
-                    all_windows = gw.getAllWindows()
+                # 再度ウィンドウの状態をチェック
+                if not window.visible or window.isMinimized:
+                    return
+
+                # --- 仮想デスクトップ移動 ---
+                target_workspace = action.get("target_workspace")
+                if isinstance(target_workspace, int):
+                    try:
+                        num_desktops = len(get_virtual_desktops())
+                        if 1 <= target_workspace <= num_desktops:
+                            logging.info(f" -> 仮想デスクトップ {target_workspace} に移動します。")
+                            AppView(hwnd=window._hWnd).move(VirtualDesktop(number=target_workspace))
+                        else:
+                            logging.warning(f"指定された仮想デスクトップ {target_workspace} は存在しません (利用可能なデスクトップ数: {num_desktops})。")
+                    except Exception as e:
+                        logging.error(f"仮想デスクトップの移動中にエラーが発生しました: {e}", exc_info=True)
+
+                # --- ウィンドウ操作 ---
+                if action.get("maximize", "").upper() == "ON":
+                    window.maximize()
+                    logging.info(" -> ウィンドウを最大化しました。")
+                elif action.get("minimize", "").upper() == "ON":
+                    window.minimize()
+                    logging.info(" -> ウィンドウを最小化しました。")
+                else:
+                    x, y, w, h = self.calculator.get_target_rect(action, window)
+                    
+                    # PyGetWindowのプロパティアクセスは遅い可能性があるので、一度だけアクセスする
+                    current_left, current_top, current_width, current_height = window.left, window.top, window.width, window.height
+                    
+                    if w != current_width or h != current_height:
+                        logging.info(f" -> サイズを {w}x{h} に変更します。")
+                        window.resizeTo(w, h)
+                    if x != current_left or y != current_top:
+                        logging.info(f" -> 位置を ({x}, {y}) に移動します。")
+                        window.moveTo(x, y)
+
+        except gw.PyGetWindowException as e:
+            logging.warning(f'ウィンドウ "{window.title}" の操作に失敗しました: {e}')
+            with self.lock:
+                self.processed_windows.discard(window._hWnd)
+        except Exception as e:
+            logging.error(f'ルール "{rule_name}" の適用中に予期せぬエラーが発生しました: {e}', exc_info=True)
+            with self.lock:
+                self.processed_windows.discard(window._hWnd)
+
+    async def _monitor_windows_async(self):
+        """ウィンドウを定期的に監視し、ルールを適用する非同期メインループ"""
+        while True:
+            if not self.running_event.is_set():
+                await asyncio.sleep(0.5) # 一時停止中は少し長めに待つ
+                continue
+
+            polling_interval_ms = self.settings.globals.get("polling_interval", 1000)
+            
+            try:
+                all_windows = gw.getAllWindows()
+                
+                with self.lock:
                     current_handles = {w._hWnd for w in all_windows}
 
                     for window in all_windows:
@@ -313,56 +397,16 @@ class WindowManager:
                         
                         for rule in self.settings.rules:
                             if self._check_rule_conditions(window, process_name, rule.get("condition", {})):
-                                rule_name = rule.get("name", "無名ルール")
-                                logging.info(f'ルール "{rule_name}" に一致: "{window.title}" (プロセス: {process_name})')
-                                action = rule.get("action", {})
-
-                                try:
-                                    # --- 仮想デスクトップ移動 ---
-                                    target_workspace = action.get("target_workspace")
-                                    if isinstance(target_workspace, int):
-                                        try:
-                                            num_desktops = len(get_virtual_desktops())
-                                            if 1 <= target_workspace <= num_desktops:
-                                                logging.info(f" -> 仮想デスクトップ {target_workspace} に移動します。")
-                                                AppView(hwnd=window._hWnd).move(VirtualDesktop(number=target_workspace))
-                                            else:
-                                                logging.warning(f"指定された仮想デスクトップ {target_workspace} は存在しません (利用可能なデスクトップ数: {num_desktops})。")
-                                        except Exception as e:
-                                            logging.error(f"仮想デスクトップの移動中にエラーが発生しました: {e}", exc_info=True)
-
-                                    # --- ウィンドウ操作 ---
-                                    if action.get("maximize", "").upper() == "ON":
-                                        window.maximize()
-                                        logging.info(" -> ウィンドウを最大化しました。")
-                                    elif action.get("minimize", "").upper() == "ON":
-                                        window.minimize()
-                                        logging.info(" -> ウィンドウを最小化しました。")
-                                    else:
-                                        x, y, w, h = self.calculator.get_target_rect(action, window)
-                                        
-                                        if w != window.width or h != window.height:
-                                            logging.info(f" -> サイズを {w}x{h} に変更します。")
-                                            window.resizeTo(w, h)
-                                        if x != window.left or y != window.top:
-                                            logging.info(f" -> 位置を ({x}, {y}) に移動します。")
-                                            window.moveTo(x, y)
-                                    
-                                    self.processed_windows.add(window._hWnd)
-                                except gw.PyGetWindowException as e:
-                                    logging.warning(f'ウィンドウ "{window.title}" の操作に失敗しました: {e}')
-                                except Exception as e:
-                                    logging.error(f'ルール "{rule_name}" の適用中に予期せぬエラーが発生しました: {e}', exc_info=True)
-                                
-                                break # このウィンドウに対する処理は終了し、次のウィンドウへ
+                                self.processed_windows.add(window._hWnd)
+                                asyncio.create_task(self._apply_rule_async(rule, window))
+                                break 
                     
-                    # 閉じたウィンドウのハンドルをセットから削除
                     self.processed_windows.intersection_update(current_handles)
 
-                except Exception as e:
-                    logging.error(f"ウィンドウ処理のメインループで予期せぬエラーが発生しました: {e}", exc_info=True)
+            except Exception as e:
+                logging.error(f"ウィンドウ処理のメインループで予期せぬエラーが発生しました: {e}", exc_info=True)
 
-            time.sleep(max(0.1, polling_interval_ms / 1000))
+            await asyncio.sleep(max(0.1, polling_interval_ms / 1000))
 
 # --- システムトレイ ---
 class Tray:
