@@ -220,6 +220,9 @@ class WindowManager:
         self.is_paused = False
         self.lock = threading.Lock()
 
+        # クリーンアップタスクをスケジュールする
+        asyncio.run_coroutine_threadsafe(self._cleanup_processed_windows_periodically(), self.loop)
+
     def _get_process_name(self, hwnd):
         """ウィンドウハンドルからプロセス名を取得する"""
         try:
@@ -303,11 +306,29 @@ class WindowManager:
             if hwnd in self.processed_windows:
                 return
         
-        try:
-            # イベント発生直後はウィンドウ情報が不完全なことがあるため、少し待つ
-            time.sleep(0.1)
+        # イベント発生直後はウィンドウ情報が不完全なことがあるため、リトライロジックを導入
+        window = None
+        for attempt in range(5):  # 最大5回リトライ
+            time.sleep(0.02)  # 20ms待機
+            try:
+                temp_window = gw.Win32Window(hwnd)
+                # ウィンドウが操作可能か基本的なチェック
+                if temp_window.visible and not temp_window.isMinimized and temp_window.title:
+                    window = temp_window
+                    break  # 成功したらループを抜ける
+            except gw.PyGetWindowException:
+                logging.debug(f"HWND {hwnd} のウィンドウはリトライ中に閉じられました。")
+                return # ウィンドウが消えたので処理終了
+            except Exception as e:
+                # 予期せぬエラーはデバッグログに出力してリトライを続ける
+                logging.debug(f"HWND {hwnd} の情報取得中に予期せぬエラー (試行 {attempt + 1}): {e}")
+                pass # その他のエラーならリトライを続ける
+
+        if not window:
+            logging.debug(f"リトライ後も HWND {hwnd} のウィンドウ情報を取得できませんでした。")
+            return
             
-            window = gw.Win32Window(hwnd)
+        try:
             if not (window.visible and not window.isMinimized and window.title):
                 return
 
@@ -422,6 +443,27 @@ class WindowManager:
         """処理済みセットからウィンドウを安全に削除する"""
         with self.lock:
             self.processed_windows.discard(hwnd)
+
+    async def _cleanup_processed_windows_periodically(self):
+        """processed_windows セットを定期的にクリーンアップする"""
+        # settings.toml から間隔を読み込む (デフォルトは5分)
+        cleanup_interval = self.settings.globals.get("cleanup_interval_seconds", 300)
+        logging.info(f"{cleanup_interval}秒ごとに無効なウィンドウハンドルのクリーンアップを実行します。")
+        
+        while True:
+            await asyncio.sleep(cleanup_interval)
+            with self.lock:
+                if not self.processed_windows:
+                    continue
+
+                logging.debug(f"クリーンアップ開始: 現在 {len(self.processed_windows)}個のウィンドウを追跡中。")
+                
+                # 存在しないウィンドウのハンドルを特定
+                invalid_hwnds = {hwnd for hwnd in self.processed_windows if not win32gui.IsWindow(hwnd)}
+                
+                if invalid_hwnds:
+                    self.processed_windows.difference_update(invalid_hwnds)
+                    logging.info(f"{len(invalid_hwnds)}個の無効なウィンドウハンドルをクリーンアップしました。")
 
 # --- Win32 イベントフック (ctypes) ---
 WINEVENTPROC = ctypes.WINFUNCTYPE(
