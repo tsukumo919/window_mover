@@ -6,3 +6,4 @@ Pillow
 screeninfo
 pyvda
 pywin32
+pydantic

@@ -15,7 +15,41 @@ from screeninfo import get_monitors
 from pyvda import AppView, VirtualDesktop, get_virtual_desktops
 import win32gui
 import win32con
-import queue
+
+# --- 定数 ---
+SETTINGS_FILE = "settings.toml"
+LOG_FILE = "log.txt"
+ANCHOR_POINTS = {
+    "TopLeft": (0.0, 0.0), "TopCenter": (0.5, 0.0), "TopRight": (1.0, 0.0),
+    "MiddleLeft": (0.0, 0.5), "MiddleCenter": (0.5, 0.5), "MiddleRight": (1.0, 0.5),
+    "BottomLeft": (0.0, 1.0), "BottomCenter": (0.5, 1.0), "BottomRight": (1.0, 1.0)
+}
+
+
+# --- ログレベル変換 ---
+def get_log_level_from_string(level_str: str) -> int:
+    """ログレベルの文字列をloggingの定数に変換する"""
+    return getattr(logging, level_str.upper(), logging.INFO)
+
+# --- ロギング設定 ---
+def setup_logging(level: int = logging.INFO):
+    """ロギングの基本設定を行う"""
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding='utf-8', mode='w'),
+            logging.StreamHandler()
+        ]
+    )
+    logging.getLogger("pyvda").setLevel(logging.INFO)
+    logging.getLogger("PIL").setLevel(logging.INFO)
+
+from settings_model import SettingsModel, MoveTo, ResizeTo
+from pydantic import ValidationError
 
 # --- 定数 ---
 SETTINGS_FILE = "settings.toml"
@@ -53,26 +87,42 @@ def setup_logging(level: int = logging.INFO):
 class Settings:
     def __init__(self, filepath):
         self.filepath = filepath
-        self.globals = {}
-        self.rules = []
-        self.ignores = []
+        self.model: SettingsModel = SettingsModel()
         self.load()
 
     def load(self):
-        """設定ファイルを読み込む"""
+        """設定ファイルを読み込み、Pydanticモデルで検証する"""
         try:
             with open(self.filepath, "r", encoding="utf-8") as f:
                 data = toml.load(f)
-            self.globals = data.get("global", {})
-            self.rules = data.get("rules", [])
-            self.ignores = data.get("ignores", [])
-            logging.info(f"設定ファイルを読み込みました。Global: {len(self.globals)}項目, Ignores: {len(self.ignores)}個, Rules: {len(self.rules)}個")
+            self.model = SettingsModel.model_validate(data)
+            logging.info(f"設定ファイルを読み込み、検証しました。Global: {len(self.model.globals.model_dump())}項目, Ignores: {len(self.model.ignores)}個, Rules: {len(self.model.rules)}個")
         except FileNotFoundError:
             logging.error(f"設定ファイル '{self.filepath}' が見つかりません。")
+            self.model = SettingsModel()
         except toml.TomlDecodeError as e:
             logging.error(f"設定ファイル '{self.filepath}' の形式が正しくありません (行: {e.lineno}, 列: {e.colno}): {e}")
+            self.model = SettingsModel()
+        except ValidationError as e:
+            logging.error(f"設定ファイル '{self.filepath}' のバリデーションに失敗しました:")
+            for error in e.errors():
+                logging.error(f"  - 場所: {' -> '.join(map(str, error['loc']))}, エラー: {error['msg']}")
+            self.model = SettingsModel()
         except Exception as e:
             logging.error(f"設定ファイルの読み込み中に予期せぬエラーが発生しました: {e}", exc_info=True)
+            self.model = SettingsModel()
+
+    @property
+    def globals(self):
+        return self.model.globals.model_dump()
+
+    @property
+    def rules(self):
+        return [rule.model_dump() for rule in self.model.rules]
+
+    @property
+    def ignores(self):
+        return [ignore.model_dump() for ignore in self.model.ignores]
 
 # --- 座標計算 ---
 class Calculator:
@@ -136,8 +186,8 @@ class Calculator:
             logging.debug(f"作業領域: {work_area_width}x{work_area_height} at ({work_area_x},{work_area_y})")
 
             resize_to = rule_action.get("resize_to", {})
-            w_val = resize_to.get("w", resize_to.get("width"))
-            h_val = resize_to.get("h", resize_to.get("height"))
+            w_val = resize_to.get("width")
+            h_val = resize_to.get("height")
             width = self._parse_value(w_val, work_area_width) if w_val is not None else window.width
             height = self._parse_value(h_val, work_area_height) if h_val is not None else window.height
             if width is None or height is None:
@@ -177,7 +227,7 @@ class Calculator:
             final_y -= int(height * anchor_y_ratio)
             logging.debug(f"ウィンドウアンカー適用後 -> ({final_x}, {final_y})")
 
-            rule_offset = rule_action.get("offset", {})
+            rule_offset = rule_action.get("offset") or {}
             offset_x = rule_offset.get("x", 0)
             offset_y = rule_offset.get("y", 0)
             if offset_x != 0 or offset_y != 0:
@@ -629,7 +679,6 @@ class Tray:
 
     def _exit_action(self, icon, item):
         logging.info("アプリケーションを終了します。")
-        self.win_event_hook.stop()
         icon.stop()
 
     def run(self):
@@ -694,8 +743,14 @@ def main():
         logging.info("アプリケーションのシャットダウン処理を開始します。")
         if win_event_hook and win_event_hook.is_alive():
             win_event_hook.stop()
+            win_event_hook.join(timeout=2)
+            if win_event_hook.is_alive():
+                logging.warning("WinEventHookThread が時間内に終了しませんでした。")
         if async_worker and async_worker.is_alive():
             async_worker.stop()
+            async_worker.join(timeout=2)
+            if async_worker.is_alive():
+                logging.warning("AsyncWorkerThread が時間内に終了しませんでした。")
         logging.info("アプリケーションが終了しました。")
 
 if __name__ == "__main__":
