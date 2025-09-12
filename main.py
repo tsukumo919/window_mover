@@ -9,6 +9,7 @@ import pygetwindow as gw
 import psutil
 import os
 import ctypes
+from ctypes import wintypes
 import re
 from screeninfo import get_monitors
 from pyvda import AppView, VirtualDesktop, get_virtual_desktops
@@ -25,7 +26,7 @@ ANCHOR_POINTS = {
     "BottomLeft": (0.0, 1.0), "BottomCenter": (0.5, 1.0), "BottomRight": (1.0, 1.0)
 }
 # WinEventHookで無視するプロセスのリスト
-IGNORED_PROCESSES = {"ApplicationFrameHost.exe", "SystemSettings.exe", "TextInputHost.exe"}
+IGNORED_PROCESSES = {"SystemSettings.exe", "TextInputHost.exe", "SearchHost.exe", "SearchApp.exe", "ShellExperienceHost.exe", "StartMenuExperienceHost.exe", "Widgets.exe", "LockApp.exe"}
 
 # --- ログレベル変換 ---
 def get_log_level_from_string(level_str: str) -> int:
@@ -291,12 +292,14 @@ class WindowManager:
             # イベント発生直後はウィンドウ情報が不完全なことがあるため、少し待つ
             time.sleep(0.1)
             
-            window = gw.PyGetWindow(hwnd)
+            window = gw.Win32Window(hwnd)
             if not (window.visible and not window.isMinimized and window.title):
                 return
 
             process_name = self._get_process_name(hwnd)
+            logging.debug(f"イベント受信: タイトル='{window.title}', プロセス='{process_name}'")
             if process_name in IGNORED_PROCESSES:
+                logging.info(f"プロセス '{process_name}' (ウィンドウタイトル: '{window.title}') は無視リストに含まれているため、処理をスキップします。")
                 return
 
             for rule in self.settings.rules:
@@ -386,7 +389,7 @@ class WindowManager:
             logging.warning(f'ウィンドウ "{window.title}" の操作に失敗しました: {e}')
             self._discard_window(window._hWnd)
         except Exception as e:
-            logging.error(f'ルール "{rule_name}" の適用中に予期せぬエラーが発生しました: {e}", exc_info=True)
+            logging.error(f'ルール "{rule_name}" の適用中に予期せぬエラーが発生しました: {e}', exc_info=True)
             self._discard_window(window._hWnd)
 
     def _discard_window(self, hwnd):
@@ -394,29 +397,35 @@ class WindowManager:
         with self.lock:
             self.processed_windows.discard(hwnd)
 
-# --- Win32 イベントフック ---
+# --- Win32 イベントフック (ctypes) ---
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND, wintypes.LONG,
+    wintypes.LONG, wintypes.DWORD, wintypes.DWORD)
+
 class WinEventHook(threading.Thread):
     def __init__(self, callback):
         super().__init__(name="WinEventHookThread", daemon=True)
         self.callback = callback
         self.hook = None
         self.running = False
+        self.user32 = ctypes.windll.user32
+        self.event_proc_obj = WINEVENTPROC(self.event_proc)
 
     def run(self):
         """イベントフックを開始し、メッセージループに入る"""
         self.running = True
         try:
-            # イベントフックを設定
-            # EVENT_OBJECT_CREATE: ウィンドウ作成時
-            # EVENT_OBJECT_SHOW: ウィンドウ表示時
-            self.hook = win32gui.SetWinEventHook(
+            self.hook = self.user32.SetWinEventHook(
                 win32con.EVENT_OBJECT_CREATE,
                 win32con.EVENT_OBJECT_SHOW,
-                0, self.event_proc, 0, 0, win32con.WINEVENT_OUTOFCONTEXT
+                0, self.event_proc_obj, 0, 0, win32con.WINEVENT_OUTOFCONTEXT
             )
             if self.hook:
                 logging.info("Win32 イベントフックを開始しました。")
-                win32gui.PumpMessages()
+                msg = wintypes.MSG()
+                while self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                    self.user32.TranslateMessage(ctypes.byref(msg))
+                    self.user32.DispatchMessageW(ctypes.byref(msg))
             else:
                 logging.error("Win32 イベントフックの開始に失敗しました。")
         except Exception as e:
@@ -427,29 +436,22 @@ class WinEventHook(threading.Thread):
     def stop(self):
         """イベントフックを解除し、メッセージループを終了する"""
         if self.hook:
-            win32gui.UnhookWinEvent(self.hook)
+            self.user32.UnhookWinEvent(self.hook)
             self.hook = None
             logging.info("Win32 イベントフックを解除しました。")
-        # メッセージループを終了させるためにダミーメッセージをポスト
-        ctypes.windll.user32.PostThreadMessageW(self.ident, win32con.WM_QUIT, 0, 0)
+        if self.running:
+            self.user32.PostThreadMessageW(self.ident, win32con.WM_QUIT, 0, 0)
         self.running = False
 
     def event_proc(self, hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
         """イベントコールバック関数"""
-        # 自分自身のスレッドIDとイベントスレッドIDを比較し、再帰呼び出しを防ぐ
         if dwEventThread == self.ident:
             return
-            
-        # アクセシビリティ関連のオブジェクトや子ウィンドウは無視
         if idObject != win32con.OBJID_WINDOW or idChild != 0:
             return
-        
-        # ウィンドウハンドルが無効、またはトップレベルウィンドウでない場合は無視
         if not hwnd or not win32gui.IsWindow(hwnd) or win32gui.GetParent(hwnd) != 0:
             return
-
         try:
-            # コールバックを呼び出してウィンドウ処理を依頼
             self.callback(hwnd)
         except Exception as e:
             logging.error(f"イベント処理コールバックでエラー (HWND: {hwnd}): {e}", exc_info=True)
