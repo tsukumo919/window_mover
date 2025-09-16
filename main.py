@@ -8,6 +8,8 @@ from PIL import Image, ImageDraw
 import pygetwindow as gw
 import psutil
 import os
+import sys
+import subprocess
 import ctypes
 from ctypes import wintypes
 import re
@@ -66,19 +68,199 @@ class Settings:
             self.model = SettingsModel.model_validate(data)
             logging.info(f"設定ファイルを読み込み、検証しました。Global: {len(self.model.globals.model_dump())}項目, Ignores: {len(self.model.ignores)}個, Rules: {len(self.model.rules)}個")
         except FileNotFoundError:
-            logging.error(f"設定ファイル '{self.filepath}' が見つかりません。")
-            self.model = SettingsModel()
+            logging.warning(f"設定ファイル '{self.filepath}' が見つかりません。デフォルト設定で新しいファイルを生成します。")
+            self._create_default_settings_file()
+            self.model = SettingsModel() # 生成後はデフォルト設定で動作
         except toml.TomlDecodeError as e:
             logging.error(f"設定ファイル '{self.filepath}' の形式が正しくありません (行: {e.lineno}, 列: {e.colno}): {e}")
             self.model = SettingsModel()
         except ValidationError as e:
             logging.error(f"設定ファイル '{self.filepath}' のバリデーションに失敗しました:")
             for error in e.errors():
-                logging.error(f"  - 場所: {' -> '.join(map(str, error['loc']))}, エラー: {error['msg']}")
+                logging.error(f"  -場所: {' -> '.join(map(str, error['loc']))}, エラー: {error['msg']}")
             self.model = SettingsModel()
         except Exception as e:
             logging.error(f"設定ファイルの読み込み中に予期せぬエラーが発生しました: {e}", exc_info=True)
             self.model = SettingsModel()
+
+    def _create_default_settings_file(self):
+        """デフォルトの設定ファイルを作成する"""
+        default_content = """#==============================================================================
+# Window Mover 設定ファイル
+#
+# このファイルでは、ウィンドウをどのように自動で移動・リサイズするかのルールを
+# 定義します。設定は大きく分けて以下の3つのセクションから構成されます。
+#
+# 1. [global]: アプリケーション全体の動作設定
+# 2. [[ignores]]: ルール適用の対象外とするウィンドウの指定
+# 3. [[rules]]: ウィンドウを操作するための具体的なルールのリスト
+#
+# ルールは上から下に順番に評価され、最初に条件が一致したルールが適用されます。
+#==============================================================================
+
+#==============================================================================
+# 1. [global] - 全体設定
+# アプリケーション全体の挙動をここで定義します。
+#==============================================================================
+[global]
+  # --- ログ設定 ---
+  # ログファイル(log.txt)に出力する情報の詳細度を設定します。
+  # "DEBUG": 最も詳細なログ。ルールの動作を細かく確認したい場合に便利です。
+  # "INFO": 標準的なログ。どのウィンドウにどのルールが適用されたかなどが記録されます。
+  # "WARNING": 警告メッセージのみ。
+  # "ERROR": エラーメッセージのみ。
+  log_level = "INFO"
+
+  # --- ルール適用のタイミング ---
+  # trueに設定すると、以下のタイミングで既存の全ウィンドウに対してルールを再適用します。
+  apply_on_startup = true   # アプリケーション起動時
+  apply_on_reload = true    # 設定ファイル再読み込み時
+  apply_on_resume = false   # 一時停止から再開した時
+
+  # --- クリーンアップ設定 ---
+  # 閉じたウィンドウの情報を内部リストから削除する頻度を秒単位で指定します。
+  cleanup_interval_seconds = 300
+
+  # --- モニターオフセット設定 ---
+  # タスクバーなど、ウィンドウを配置したくない領域をモニターごとに予約します。
+  # ここで設定した値は、`move_to`でアンカーポイント("MiddleCenter"など)を指定した際の
+  # 「作業領域」の計算に使われます。
+  [global.monitor_offsets]
+    # `monitor_N`の指定がないモニターに適用されるデフォルト値
+    default = { top = 0, bottom = 0, left = 0, right = 0 }
+
+    # モニター1番に対する設定 (例: 下部に48pxのタスクバーがある場合)
+    monitor_1 = { top = 0, bottom = 48, left = 0, right = 0 }
+
+    # モニター2番に対する設定 (例: 上部に32px、左側に64pxの領域を予約)
+    # monitor_2 = { top = 32, bottom = 0, left = 64, right = 0 }
+
+
+#==============================================================================
+# 2. [[ignores]] - 無視ルール
+# ここで指定した条件に一致するウィンドウは、以降の[[rules]]で処理されません。
+# OSのUIコンポーネントなど、動かしたくないウィンドウを指定するのに役立ちます。
+#==============================================================================
+[[ignores]]
+  name = "OS標準UIと特定のアプリを無視"
+  
+  # "OR": いずれかの条件に一致すれば無視
+  # "AND": すべての条件に一致した場合のみ無視
+  logic = "OR"
+  
+  conditions = [
+    # --- プロセス名で無視 ---
+    { process = "SystemSettings.exe" },      # Windows 設定
+    { process = "TextInputHost.exe" },       # テキスト入力UI
+    { process = "SearchHost.exe" },          # 検索UI
+    { process = "ShellExperienceHost.exe" }, # シェルUI
+    { process = "StartMenuExperienceHost.exe" }, # スタートメニュー
+    
+    # --- ウィンドウクラス名で無視 ---
+    { class = "Shell_TrayWnd" },        # タスクバー
+    { class = "VirtualDesktopHotkeySwitcher" }, # 仮想デスクトップスイッチャー
+  ]
+
+
+#==============================================================================
+# 3. [[rules]] - 個別ルール
+# ウィンドウをどのように配置するかを具体的に定義します。
+# ルールはこのファイルの上から順にチェックされ、最初に一致したものが適用されます。
+#==============================================================================
+
+# --- サンプルルール 1: 基本的な配置 (電卓) ---
+# ウィンドウタイトルで「電卓」を識別し、画面中央に固定サイズで配置します。
+[[rules]]
+  name = "電卓を中央に"
+
+  [rules.condition]
+    title = "電卓" # ウィンドウタイトルに「電卓」が含まれていれば一致
+
+  [rules.action]
+    anchor = "MiddleCenter"  # ウィンドウの中心を基点に
+    move_to = "MiddleCenter" # モニターの作業領域の中心に移動
+    resize_to = { width = 320, height = 480 } # サイズを 320x480 ピクセルに
+
+# --- サンプルルール 2: 正規表現と遅延実行 (メモ帳) ---
+# 正規表現を使って複数のタイトルパターンに一致させ、3秒待ってから処理します。
+[[rules]]
+  name = "新規のメモ帳を左上に"
+
+  [rules.condition]
+    logic = "OR" # いずれかのタイトルに一致すればOK
+    conditions = [
+      { title = "regex:^タイトルなし - メモ帳$" }, # タイトルが完全に一致
+      { title = "regex:^無題 - メモ帳$" }
+    ]
+
+  [rules.action]
+    # anchorのデフォルトは"TopLeft"なので、ウィンドウの左上が基点になります。
+    # `move_to`を座標で指定すると、monitor_offsetsは無視され、モニターの左上隅が(0,0)となります。
+    move_to = { x = 10, y = 10 } # モニターの左上から (10px, 10px) の位置へ
+    resize_to = { width = "40%", height = "70%" } # モニターの作業領域に対して40% x 70%のサイズに
+    execution_delay = 1500 # 1500ms = 1.5秒待ってから実行
+
+# --- サンプルルール 3: プロセス名、別モニター、オフセット (ペイント) ---
+# プロセス名でペイントを識別し、2番モニターの右下に、少し余白を空けて配置します。
+[[rules]]
+  name = "ペイントを2番モニターの右下へ"
+
+  [rules.condition]
+    # プロセス名が "mspaint.exe" または "pbrush.exe" に一致
+    process = "regex:(mspaint|pbrush)\.exe"
+    case_sensitive = false # 大文字・小文字を区別しない (デフォルト)
+
+  [rules.action]
+    target_monitor = 2       # 2番目のモニターを対象に
+    anchor = "BottomRight"   # ウィンドウの右下を基点に
+    move_to = "BottomRight"  # 対象モニターの作業領域の右下に移動
+    offset = { x = -10, y = -10 } # そこからさらに (-10px, -10px) ずらす
+
+# --- サンプルルール 4: 最大化・最小化 ---
+# 特定のウィンドウを強制的に最大化、または最小化します。
+[[rules]]
+  name = "特定のアプリを最大化"
+  [rules.condition]
+    title = "MaximizeApp"
+  [rules.action]
+    maximize = "ON"
+
+[[rules]]
+  name = "特定のアプリを最小化"
+  [rules.condition]
+    title = "MinimizeApp"
+  [rules.action]
+    minimize = "ON"
+
+# --- サンプルルール 5: 仮想デスクトップへの移動 ---
+# 特定のウィンドウを指定した仮想デスクトップへ移動します。
+[[rules]]
+  name = "特定のウィンドウを仮想デスクトップ2へ"
+  [rules.condition]
+    title = "仮想デスクトップ2へ移動"
+  [rules.action]
+    target_workspace = 2 # 2番の仮想デスクトップへ移動
+    # move_toやresize_toと組み合わせることも可能です
+    anchor = "TopLeft"
+    move_to = "TopLeft"
+
+# --- サンプルルール 6: ウィンドウクラス名での指定 ---
+# ゲームや一部のアプリケーションでは、ウィンドウクラス名での指定が有効な場合があります。
+# (クラス名は`log.txt`をDEBUGレベルにして確認できます)
+[[rules]]
+  name = "ウィンドウクラス名での指定"
+  [rules.condition]
+    class = "ApplicationClassName"
+  [rules.action]
+    anchor = "MiddleCenter"
+    move_to = "MiddleCenter"
+"""
+        try:
+            with open(self.filepath, "w", encoding="utf-8") as f:
+                f.write(default_content)
+            logging.info(f"デフォルトの設定ファイルを '{self.filepath}' に生成しました。")
+        except Exception as e:
+            logging.error(f"デフォルト設定ファイルの生成に失敗しました: {e}", exc_info=True)
 
     @property
     def globals(self):
@@ -659,13 +841,13 @@ class WinEventHook(threading.Thread):
 
 # --- システムトレイ ---
 class Tray:
-    def __init__(self, window_manager, win_event_hook):
+    def __init__(self, window_manager, win_event_hook, application_path):
         self.window_manager = window_manager
         self.win_event_hook = win_event_hook
 
         try:
-            self.icon_running = Image.open("window_mover.ico")
-            self.icon_paused = Image.open("window_mover_pause.ico")
+            self.icon_running = Image.open(os.path.join(application_path, "window_mover.ico"))
+            self.icon_paused = Image.open(os.path.join(application_path, "window_mover_pause.ico"))
         except FileNotFoundError as e:
             logging.warning(f"アイコンファイルが見つかりません ({e.filename})。デフォルトアイコンを生成します。")
             self.icon_running = self._create_default_image(64, 64, "black", "white")
@@ -681,11 +863,26 @@ class Tray:
                 self._toggle_pause_action
             ),
             pystray.MenuItem("設定を再読み込み", self._reload_settings_action),
+            pystray.MenuItem("ログを開く", self._open_log_action),
             pystray.MenuItem("ログをクリア", self._clear_log_action),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("終了", self._exit_action)
         )
         self.icon = pystray.Icon("window_mover", self.icon_running, "Window Mover", menu)
+
+    def _open_log_action(self, icon, item):
+        """ログファイルをnotepad.exeで開く"""
+        try:
+            # LOG_FILEはmain()で絶対パスに更新されているグローバル変数
+            if os.path.exists(LOG_FILE):
+                subprocess.run(["notepad.exe", LOG_FILE])
+                logging.info(f"ログファイル '{LOG_FILE}' を開きました。")
+            else:
+                logging.warning(f"ログファイル '{LOG_FILE}' が見つかりません。")
+        except FileNotFoundError:
+            logging.error("notepad.exeが見つかりませんでした。パスが通っているか確認してください。")
+        except Exception as e:
+            logging.error(f"ログファイルを開く際にエラーが発生しました: {e}", exc_info=True)
 
     def _clear_log_action(self, icon, item):
         """ログファイルをクリアする"""
@@ -736,17 +933,35 @@ class AsyncWorker(threading.Thread):
 
 # --- メイン処理 ---
 def main():
+    # --- パス設定 ---
+    # 実行ファイル（.exe）またはスクリプト（.py）の場所を基準にパスを解決する
+    if getattr(sys, 'frozen', False):
+        # PyInstallerでバンドルされた場合、実行ファイルのディレクトリ
+        application_path = os.path.dirname(sys.executable)
+    else:
+        # スクリプトとして実行された場合、このファイルのディレクトリ
+        application_path = os.path.dirname(os.path.abspath(__file__))
+
+    # ユーザーが編集する設定ファイルは、application_path を基準にする
+    settings_file_path = os.path.join(application_path, SETTINGS_FILE)
+    
+    # ログファイルも同じ場所に生成する
+    global LOG_FILE
+    LOG_FILE = os.path.join(application_path, LOG_FILE)
+    
+    # --- 処理開始 ---
     setup_logging()
     
     async_worker = None
     win_event_hook = None
     
     try:
-        settings = Settings(SETTINGS_FILE)
+        settings = Settings(settings_file_path)
         log_level_str = settings.globals.get("log_level", "INFO")
         log_level = get_log_level_from_string(log_level_str)
         setup_logging(level=log_level)
         logging.info(f"ログレベルを「{log_level_str}」に設定しました。")
+        logging.info(f"設定ファイルを '{settings_file_path}' から読み込みました。")
 
         logging.info("アプリケーションを開始します。")
 
@@ -767,7 +982,7 @@ def main():
         
         threading.Thread(target=startup_task, daemon=True).start()
 
-        tray = Tray(window_manager, win_event_hook)
+        tray = Tray(window_manager, win_event_hook, application_path)
         tray.run() # これはブロッキング呼び出し
 
     except Exception as e:

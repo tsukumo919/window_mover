@@ -111,7 +111,7 @@
     # `move_to`を座標で指定すると、monitor_offsetsは無視され、モニターの左上隅が(0,0)となります。
     move_to = { x = 10, y = 10 } # モニターの左上から (10px, 10px) の位置へ
     resize_to = { width = "40%", height = "70%" } # モニターの作業領域に対して40% x 70%のサイズに
-    execution_delay = 3000 # 3000ms = 3秒待ってから実行
+    execution_delay = 1500 # 1500ms = 1.5秒待ってから実行
 
 # --- サンプルルール 3: プロセス名、別モニター、オフセット (ペイント) ---
 # プロセス名でペイントを識別し、2番モニターの右下に、少し余白を空けて配置します。
@@ -161,10 +161,9 @@
 # ゲームや一部のアプリケーションでは、ウィンドウクラス名での指定が有効な場合があります。
 # (クラス名は`log.txt`をDEBUGレベルにして確認できます)
 [[rules]]
-  name = "Crescent Eveを中央に"
+  name = "ウィンドウクラス名での指定"
   [rules.condition]
-    class = "CrescentEveMainWindowClass"
+    class = "ApplicationClassName"
   [rules.action]
     anchor = "MiddleCenter"
     move_to = "MiddleCenter"
-    resize_to = { w = 640, h = 860 } # w/h は width/height の省略形
