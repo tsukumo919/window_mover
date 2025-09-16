@@ -1,157 +1,170 @@
-#================================================================
-# Window Mover Settings
-#================================================================
+#==============================================================================
+# Window Mover 設定ファイル
+#
+# このファイルでは、ウィンドウをどのように自動で移動・リサイズするかのルールを
+# 定義します。設定は大きく分けて以下の3つのセクションから構成されます。
+#
+# 1. [global]: アプリケーション全体の動作設定
+# 2. [[ignores]]: ルール適用の対象外とするウィンドウの指定
+# 3. [[rules]]: ウィンドウを操作するための具体的なルールのリスト
+#
+# ルールは上から下に順番に評価され、最初に条件が一致したルールが適用されます。
+#==============================================================================
 
-# --- 全体設定 ---
+#==============================================================================
+# 1. [global] - 全体設定
+# アプリケーション全体の挙動をここで定義します。
+#==============================================================================
 [global]
-
-
   # --- ログ設定 ---
-  # ログファイルに出力するログレベル。 "DEBUG", "INFO", "WARNING", "ERROR" から選択。
-  log_level = "DEBUG"
+  # ログファイル(log.txt)に出力する情報の詳細度を設定します。
+  # "DEBUG": 最も詳細なログ。ルールの動作を細かく確認したい場合に便利です。
+  # "INFO": 標準的なログ。どのウィンドウにどのルールが適用されたかなどが記録されます。
+  # "WARNING": 警告メッセージのみ。
+  # "ERROR": エラーメッセージのみ。
+  log_level = "INFO"
 
-  # --- 既存ウィンドウへのルール適用タイミング ---
-  # 起動時に既存のウィンドウすべてにルールを適用するか
-  apply_on_startup = true
-  # 設定再読み込み時に既存のウィンドウすべてにルールを適用するか
-  apply_on_reload = true
-  # 一時停止から再開する時に既存のウィンドウすべてにルールを適用するか
-  apply_on_resume = false
+  # --- ルール適用のタイミング ---
+  # trueに設定すると、以下のタイミングで既存の全ウィンドウに対してルールを再適用します。
+  apply_on_startup = true   # アプリケーション起動時
+  apply_on_reload = true    # 設定ファイル再読み込み時
+  apply_on_resume = false   # 一時停止から再開した時
 
-  # 無効なウィンドウハンドルを追跡リストから削除する間隔（秒）
+  # --- クリーンアップ設定 ---
+  # 閉じたウィンドウの情報を内部リストから削除する頻度を秒単位で指定します。
   cleanup_interval_seconds = 300
 
-  # モニターオフセットの設定
+  # --- モニターオフセット設定 ---
+  # タスクバーなど、ウィンドウを配置したくない領域をモニターごとに予約します。
+  # ここで設定した値は、`move_to`でアンカーポイント("MiddleCenter"など)を指定した際の
+  # 「作業領域」の計算に使われます。
   [global.monitor_offsets]
-  # モニター個別の設定がない場合に適用されるデフォルトのオフセット
-  default = { top = 0, bottom = 0, left = 0, right = 0 }
-  # モニター1にはタスクバー等を考慮したオフセットを適用(move_to = "MiddleCenter"など9ポイントモード指定の場合)
-  monitor_1 = { top = 0, bottom = 48, left = 0, right = 0 }
+    # `monitor_N`の指定がないモニターに適用されるデフォルト値
+    default = { top = 0, bottom = 0, left = 0, right = 0 }
 
-#================================================================
-# Ignores - ここに記述された条件に一致するウィンドウは処理対象外になります
-#================================================================
+    # モニター1番に対する設定 (例: 下部に48pxのタスクバーがある場合)
+    monitor_1 = { top = 0, bottom = 48, left = 0, right = 0 }
+
+    # モニター2番に対する設定 (例: 上部に32px、左側に64pxの領域を予約)
+    # monitor_2 = { top = 32, bottom = 0, left = 64, right = 0 }
+
+
+#==============================================================================
+# 2. [[ignores]] - 無視ルール
+# ここで指定した条件に一致するウィンドウは、以降の[[rules]]で処理されません。
+# OSのUIコンポーネントなど、動かしたくないウィンドウを指定するのに役立ちます。
+#==============================================================================
 [[ignores]]
-  name = "無視リスト"
+  name = "OS標準UIと特定のアプリを無視"
+  
+  # "OR": いずれかの条件に一致すれば無視
+  # "AND": すべての条件に一致した場合のみ無視
   logic = "OR"
+  
   conditions = [
     # --- プロセス名で無視 ---
     { process = "SystemSettings.exe" },      # Windows 設定
     { process = "TextInputHost.exe" },       # テキスト入力UI
     { process = "SearchHost.exe" },          # 検索UI
-    { process = "SearchApp.exe" },           # 検索UI
     { process = "ShellExperienceHost.exe" }, # シェルUI
     { process = "StartMenuExperienceHost.exe" }, # スタートメニュー
-    { process = "Widgets.exe" },             # ウィジェット
-    { process = "LockApp.exe" },             # ロック画面
-    # --- クラス名で無視 ---
-    { class = "VirtualDesktopHotkeySwitcher" } # 仮想デスクトップスイッチャー
-    { class = "Shell_TrayWnd" }              # タスクバー
     
+    # --- ウィンドウクラス名で無視 ---
+    { class = "Shell_TrayWnd" },        # タスクバー
+    { class = "VirtualDesktopHotkeySwitcher" }, # 仮想デスクトップスイッチャー
   ]
 
-#================================================================
-# Rules - ここから下に個別のルールを記述します
-#================================================================
 
+#==============================================================================
+# 3. [[rules]] - 個別ルール
+# ウィンドウをどのように配置するかを具体的に定義します。
+# ルールはこのファイルの上から順にチェックされ、最初に一致したものが適用されます。
+#==============================================================================
+
+# --- サンプルルール 1: 基本的な配置 (電卓) ---
+# ウィンドウタイトルで「電卓」を識別し、画面中央に固定サイズで配置します。
 [[rules]]
-  name = "電卓を画面中央に320px x 480pxで表示"
+  name = "電卓を中央に"
 
   [rules.condition]
-  title = "電卓"
+    title = "電卓" # ウィンドウタイトルに「電卓」が含まれていれば一致
 
   [rules.action]
-  anchor = "MiddleCenter"
-  move_to = "MiddleCenter"
-  resize_to = { width = 320, height = 480 } # 数値のみはpx扱い
+    anchor = "MiddleCenter"  # ウィンドウの中心を基点に
+    move_to = "MiddleCenter" # モニターの作業領域の中心に移動
+    resize_to = { width = 320, height = 480 } # サイズを 320x480 ピクセルに
 
+# --- サンプルルール 2: 正規表現と遅延実行 (メモ帳) ---
+# 正規表現を使って複数のタイトルパターンに一致させ、3秒待ってから処理します。
 [[rules]]
-  name = "タイトルなしのメモ帳を正規表現/OR条件で検出し、画面の左上から10px x 10px の位置に320px x 720pxで表示。3秒後に処理"
+  name = "新規のメモ帳を左上に"
 
   [rules.condition]
-  logic = "OR"
-  conditions = [
-    { title = "regex:^タイトルなし - メモ帳$" },
-    { title = "regex:^無題 - メモ帳$" }
-  ]
+    logic = "OR" # いずれかのタイトルに一致すればOK
+    conditions = [
+      { title = "regex:^タイトルなし - メモ帳$" }, # タイトルが完全に一致
+      { title = "regex:^無題 - メモ帳$" }
+    ]
 
   [rules.action]
-  # デフォルトでアンカーはTopLeftのため省略可能
-  # anchor = "TopLeft"
-  # move_toを絶対値で指定の場合は、モニターオフセットは計算から除外する
-  move_to = { x = "10px", y = "10px"}
-  resize_to = { width = "480px", height = "720px"}
-  execution_delay = 3000 # 3000ms = 3秒の実行遅延
+    # anchorのデフォルトは"TopLeft"なので、ウィンドウの左上が基点になります。
+    # `move_to`を座標で指定すると、monitor_offsetsは無視され、モニターの左上隅が(0,0)となります。
+    move_to = { x = 10, y = 10 } # モニターの左上から (10px, 10px) の位置へ
+    resize_to = { width = "40%", height = "70%" } # モニターの作業領域に対して40% x 70%のサイズに
+    execution_delay = 3000 # 3000ms = 3秒待ってから実行
 
+# --- サンプルルール 3: プロセス名、別モニター、オフセット (ペイント) ---
+# プロセス名でペイントを識別し、2番モニターの右下に、少し余白を空けて配置します。
 [[rules]]
-  name = "ペイントを右下の作業領域に"
+  name = "ペイントを2番モニターの右下へ"
 
   [rules.condition]
-  process = "regex:(mspaint|pbrush)\\.exe"
+    # プロセス名が "mspaint.exe" または "pbrush.exe" に一致
+    process = "regex:(mspaint|pbrush)\\.exe"
+    case_sensitive = false # 大文字・小文字を区別しない (デフォルト)
 
   [rules.action]
-  anchor = "BottomRight"
-  move_to = "BottomRight"
-  #このルール独自のオフセットを追加
-  offset = { x = -20, y = -20 }
-  target_monitor = 2
+    target_monitor = 2       # 2番目のモニターを対象に
+    anchor = "BottomRight"   # ウィンドウの右下を基点に
+    move_to = "BottomRight"  # 対象モニターの作業領域の右下に移動
+    offset = { x = -10, y = -10 } # そこからさらに (-10px, -10px) ずらす
+
+# --- サンプルルール 4: 最大化・最小化 ---
+# 特定のウィンドウを強制的に最大化、または最小化します。
+[[rules]]
+  name = "特定のアプリを最大化"
+  [rules.condition]
+    title = "MaximizeApp"
+  [rules.action]
+    maximize = "ON"
 
 [[rules]]
-  name = "Crescent Eveを画面中央に"
-
+  name = "特定のアプリを最小化"
   [rules.condition]
-  class = "CrescentEveMainWindowClass"
-
+    title = "MinimizeApp"
   [rules.action]
-  anchor = "MiddleCenter"
-  move_to = "MiddleCenter"
-  resize_to = { w = 640, h = 860 }
+    minimize = "ON"
 
-[[rules]]
-  name = "ウィンドウの中心を横20%、縦30%の位置に、画面の横80%、縦70%のサイズで表示"
-
-  [rules.condition]
-  title = "SomeApp"
-
-  [rules.action]
-  anchor = "MiddleCenter"
-  move_to = { x = "20%", y = "30%"}
-  # width/heightはw/hで省略表記も可能
-  resize_to = { w = "80%", h = "70%" }
-
-[[rules]]
-  name = "ウィンドウを最大化"
-
-  [rules.condition]
-  title = "MaximizeApp"
-
-  [rules.action]
-  maximize = "ON"
-
-[[rules]]
-  name = "ウィンドウを最小化"
-
-  [rules.condition]
-  title = "MinimizeApp"
-
-  [rules.action]
-  minimize = "ON"
-
-[[rules]]
-  name = "特定のウィンドウをモニター2へ"
-
-  [rules.condition]
-  title = "モニター2へ移動"
-
-  [rules.action]
-  target_monitor = 2
-
+# --- サンプルルール 5: 仮想デスクトップへの移動 ---
+# 特定のウィンドウを指定した仮想デスクトップへ移動します。
 [[rules]]
   name = "特定のウィンドウを仮想デスクトップ2へ"
-
   [rules.condition]
-  title = "仮想デスクトップ2へ移動"
-
+    title = "仮想デスクトップ2へ移動"
   [rules.action]
-  # 仮想デスクトップの番号（1から始まる）
-  target_workspace = 2
+    target_workspace = 2 # 2番の仮想デスクトップへ移動
+    # move_toやresize_toと組み合わせることも可能です
+    anchor = "TopLeft"
+    move_to = "TopLeft"
+
+# --- サンプルルール 6: ウィンドウクラス名での指定 ---
+# ゲームや一部のアプリケーションでは、ウィンドウクラス名での指定が有効な場合があります。
+# (クラス名は`log.txt`をDEBUGレベルにして確認できます)
+[[rules]]
+  name = "Crescent Eveを中央に"
+  [rules.condition]
+    class = "CrescentEveMainWindowClass"
+  [rules.action]
+    anchor = "MiddleCenter"
+    move_to = "MiddleCenter"
+    resize_to = { w = 640, h = 860 } # w/h は width/height の省略形
