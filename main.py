@@ -15,41 +15,9 @@ from screeninfo import get_monitors
 from pyvda import AppView, VirtualDesktop, get_virtual_desktops
 import win32gui
 import win32con
-
-# --- 定数 ---
-SETTINGS_FILE = "settings.toml"
-LOG_FILE = "log.txt"
-ANCHOR_POINTS = {
-    "TopLeft": (0.0, 0.0), "TopCenter": (0.5, 0.0), "TopRight": (1.0, 0.0),
-    "MiddleLeft": (0.0, 0.5), "MiddleCenter": (0.5, 0.5), "MiddleRight": (1.0, 0.5),
-    "BottomLeft": (0.0, 1.0), "BottomCenter": (0.5, 1.0), "BottomRight": (1.0, 1.0)
-}
-
-
-# --- ログレベル変換 ---
-def get_log_level_from_string(level_str: str) -> int:
-    """ログレベルの文字列をloggingの定数に変換する"""
-    return getattr(logging, level_str.upper(), logging.INFO)
-
-# --- ロギング設定 ---
-def setup_logging(level: int = logging.INFO):
-    """ロギングの基本設定を行う"""
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-    
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding='utf-8', mode='w'),
-            logging.StreamHandler()
-        ]
-    )
-    logging.getLogger("pyvda").setLevel(logging.INFO)
-    logging.getLogger("PIL").setLevel(logging.INFO)
+from pydantic import ValidationError
 
 from settings_model import SettingsModel, MoveTo, ResizeTo
-from pydantic import ValidationError
 
 # --- 定数 ---
 SETTINGS_FILE = "settings.toml"
@@ -148,73 +116,87 @@ class Calculator:
                 return None
         return None
 
+    def _get_target_monitor(self, rule_action, window):
+        """ルールとウィンドウ情報に基づき、ターゲットモニターを決定する"""
+        target_monitor_num = rule_action.get("target_monitor")
+        if target_monitor_num is not None:
+            if isinstance(target_monitor_num, int) and 1 <= target_monitor_num <= len(self.monitors):
+                monitor = self.monitors[target_monitor_num - 1]
+                logging.debug(f"ルール指定により、ターゲットモニター {target_monitor_num} を使用します。")
+                return monitor
+            else:
+                logging.warning(f"指定されたターゲットモニター番号 '{target_monitor_num}' は無効です（有効範囲: 1～{len(self.monitors)}）。フォールバックしてモニターを自動検出します。")
+        
+        return self.get_window_monitor(window)
+
+    def _get_work_area(self, monitor, is_absolute_move):
+        """モニターの作業領域を計算する"""
+        monitor_idx = self.monitors.index(monitor)
+        monitor_id = f"monitor_{monitor_idx + 1}"
+        logging.debug(f"対象モニター: {monitor_id} ({monitor.width}x{monitor.height} at ({monitor.x},{monitor.y}))")
+
+        offsets = self.globals.get("monitor_offsets", {})
+        g_offset = {}
+        if not is_absolute_move:
+            g_offset = offsets.get(monitor_id, offsets.get("default", {}))
+            logging.debug(f"グローバルオフセットを適用します: {g_offset}")
+
+        offset_top = g_offset.get("top", 0)
+        offset_bottom = g_offset.get("bottom", 0)
+        offset_left = g_offset.get("left", 0)
+        offset_right = g_offset.get("right", 0)
+
+        work_area_x = monitor.x + offset_left
+        work_area_y = monitor.y + offset_top
+        work_area_width = monitor.width - offset_left - offset_right
+        work_area_height = monitor.height - offset_top - offset_bottom
+        logging.debug(f"作業領域: {work_area_width}x{work_area_height} at ({work_area_x},{work_area_y})")
+        return work_area_x, work_area_y, work_area_width, work_area_height
+
+    def _calculate_new_size(self, resize_to, work_area_width, work_area_height, window):
+        """新しいウィンドウサイズを計算する"""
+        w_val = resize_to.get("width")
+        h_val = resize_to.get("height")
+        width = self._parse_value(w_val, work_area_width) if w_val is not None else window.width
+        height = self._parse_value(h_val, work_area_height) if h_val is not None else window.height
+        if width is None or height is None:
+            logging.warning("サイズ指定の解析に失敗したため、現在のサイズを維持します。")
+            width = window.width if width is None else width
+            height = window.height if height is None else height
+        return width, height
+
+    def _calculate_new_position(self, move_to, work_area_x, work_area_y, work_area_width, work_area_height, monitor):
+        """新しいウィンドウの基準位置を計算する"""
+        base_x, base_y = None, None
+        if isinstance(move_to, str):
+            target_anchor_name = move_to
+            target_x_ratio, target_y_ratio = ANCHOR_POINTS.get(target_anchor_name, (0.0, 0.0))
+            base_x = work_area_x + int(work_area_width * target_x_ratio)
+            base_y = work_area_y + int(work_area_height * target_y_ratio)
+            logging.debug(f"移動先アンカー '{target_anchor_name}' -> ベース座標 ({base_x}, {base_y})")
+        elif isinstance(move_to, dict):
+            abs_x_val = move_to.get("x")
+            abs_y_val = move_to.get("y")
+            abs_x = self._parse_value(abs_x_val, monitor.width)
+            abs_y = self._parse_value(abs_y_val, monitor.height)
+            if abs_x is not None: base_x = monitor.x + abs_x
+            if abs_y is not None: base_y = monitor.y + abs_y
+            logging.debug(f"絶対/相対座標 {move_to} -> ベース座標 ({base_x}, {base_y})")
+        return base_x, base_y
+
     def get_target_rect(self, rule_action, window):
         """ルールとウィンドウ情報に基づき、最終的な座標とサイズ (x, y, w, h) を計算する"""
         try:
-            monitor = None
-            target_monitor_num = rule_action.get("target_monitor")
-            if target_monitor_num is not None:
-                if isinstance(target_monitor_num, int) and 1 <= target_monitor_num <= len(self.monitors):
-                    monitor = self.monitors[target_monitor_num - 1]
-                    logging.debug(f"ルール指定により、ターゲットモニター {target_monitor_num} を使用します。")
-                else:
-                    logging.warning(f"指定されたターゲットモニター番号 '{target_monitor_num}' は無効です（有効範囲: 1～{len(self.monitors)}）。フォールバックしてモニターを自動検出します。")
-            
-            if monitor is None:
-                monitor = self.get_window_monitor(window)
-
+            monitor = self._get_target_monitor(rule_action, window)
             is_absolute_move = isinstance(rule_action.get("move_to"), dict)
-            monitor_idx = self.monitors.index(monitor)
-            monitor_id = f"monitor_{monitor_idx + 1}"
-            logging.debug(f"対象モニター: {monitor_id} ({monitor.width}x{monitor.height} at ({monitor.x},{monitor.y}))")
-
-            offsets = self.globals.get("monitor_offsets", {})
-            g_offset = {}
-            if not is_absolute_move:
-                g_offset = offsets.get(monitor_id, offsets.get("default", {}))
-                logging.debug(f"グローバルオフセットを適用します: {g_offset}")
-
-            offset_top = g_offset.get("top", 0)
-            offset_bottom = g_offset.get("bottom", 0)
-            offset_left = g_offset.get("left", 0)
-            offset_right = g_offset.get("right", 0)
-
-            work_area_x = monitor.x + offset_left
-            work_area_y = monitor.y + offset_top
-            work_area_width = monitor.width - offset_left - offset_right
-            work_area_height = monitor.height - offset_top - offset_bottom
-            logging.debug(f"作業領域: {work_area_width}x{work_area_height} at ({work_area_x},{work_area_y})")
+            
+            work_area_x, work_area_y, work_area_width, work_area_height = self._get_work_area(monitor, is_absolute_move)
 
             resize_to = rule_action.get("resize_to") or {}
-            w_val = resize_to.get("width")
-            h_val = resize_to.get("height")
-            width = self._parse_value(w_val, work_area_width) if w_val is not None else window.width
-            height = self._parse_value(h_val, work_area_height) if h_val is not None else window.height
-            if width is None or height is None:
-                logging.warning("サイズ指定の解析に失敗したため、現在のサイズを維持します。")
-                width = window.width if width is None else width
-                height = window.height if height is None else height
+            width, height = self._calculate_new_size(resize_to, work_area_width, work_area_height, window)
 
             move_to = rule_action.get("move_to")
-            anchor_name = rule_action.get("anchor", "TopLeft")
-            anchor_x_ratio, anchor_y_ratio = ANCHOR_POINTS.get(anchor_name, (0.0, 0.0))
-            logging.debug(f"ウィンドウのアンカー: {anchor_name} ({anchor_x_ratio}, {anchor_y_ratio})")
-
-            base_x, base_y = None, None
-            if isinstance(move_to, str):
-                target_anchor_name = move_to
-                target_x_ratio, target_y_ratio = ANCHOR_POINTS.get(target_anchor_name, (0.0, 0.0))
-                base_x = work_area_x + int(work_area_width * target_x_ratio)
-                base_y = work_area_y + int(work_area_height * target_y_ratio)
-                logging.debug(f"移動先アンカー '{target_anchor_name}' -> ベース座標 ({base_x}, {base_y})")
-            elif isinstance(move_to, dict):
-                abs_x_val = move_to.get("x")
-                abs_y_val = move_to.get("y")
-                abs_x = self._parse_value(abs_x_val, monitor.width)
-                abs_y = self._parse_value(abs_y_val, monitor.height)
-                if abs_x is not None: base_x = monitor.x + abs_x
-                if abs_y is not None: base_y = monitor.y + abs_y
-                logging.debug(f"絶対/相対座標 {move_to} -> ベース座標 ({base_x}, {base_y})")
+            base_x, base_y = self._calculate_new_position(move_to, work_area_x, work_area_y, work_area_width, work_area_height, monitor)
 
             if base_x is None and base_y is None:
                 logging.debug("移動指定がないため、現在の位置を基準とします。")
@@ -223,6 +205,9 @@ class Calculator:
             final_x = base_x if base_x is not None else window.left
             final_y = base_y if base_y is not None else window.top
 
+            anchor_name = rule_action.get("anchor", "TopLeft")
+            anchor_x_ratio, anchor_y_ratio = ANCHOR_POINTS.get(anchor_name, (0.0, 0.0))
+            logging.debug(f"ウィンドウのアンカー: {anchor_name} ({anchor_x_ratio}, {anchor_y_ratio})")
             final_x -= int(width * anchor_x_ratio)
             final_y -= int(height * anchor_y_ratio)
             logging.debug(f"ウィンドウアンカー適用後 -> ({final_x}, {final_y})")
@@ -273,6 +258,68 @@ class WindowManager:
         # クリーンアップタスクをスケジュールする
         asyncio.run_coroutine_threadsafe(self._cleanup_processed_windows_periodically(), self.loop)
 
+    def clear_log(self):
+        """ログファイルをクリアする"""
+        with self.lock:
+            try:
+                log_level_str = self.settings.globals.get("log_level", "INFO")
+                log_level = get_log_level_from_string(log_level_str)
+                setup_logging(level=log_level)
+                logging.info("ログファイルをクリアしました。")
+            except Exception as e:
+                print(f"ログファイルのクリア中にエラーが発生しました: {e}")
+                logging.error(f"ログファイルのクリア中にエラーが発生しました: {e}", exc_info=True)
+
+    def toggle_pause(self):
+        """一時停止と再開を切り替える"""
+        with self.lock:
+            self.is_paused = not self.is_paused
+            paused = self.is_paused
+        
+        if paused:
+            logging.info("処理を一時停止しました。")
+        else:
+            logging.info("処理を再開しました。")
+            if self.settings.globals.get("apply_on_resume", True):
+                self.processed_windows.clear()
+                logging.info("すべてのウィンドウにルールを再適用します。")
+                self.process_existing_windows()
+            else:
+                logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
+        return paused
+
+    def reload_settings(self):
+        """設定ファイルを再読み込みし、必要に応じてルールを再適用する"""
+        logging.info("設定の再読み込みを開始します。")
+        
+        apply_on_reload_flag = False
+        try:
+            with self.lock:
+                self.settings.load()
+                monitors = get_monitors()
+                self.calculator = Calculator(monitors, self.settings.globals)
+                logging.info(f"{len(monitors)}個のモニター情報を更新しました。")
+
+                log_level_str = self.settings.globals.get("log_level", "INFO")
+                log_level = get_log_level_from_string(log_level_str)
+                setup_logging(level=log_level)
+                logging.info(f"ログレベルを「{log_level_str}」に設定しました。")
+                
+                apply_on_reload_flag = self.settings.globals.get("apply_on_reload", True)
+
+        except Exception as e:
+            logging.error(f"設定の再読み込み中に予期せぬエラーが発生しました: {e}", exc_info=True)
+            return
+
+        if apply_on_reload_flag:
+            logging.info("すべてのウィンドウにルールを再適用します。")
+            self.processed_windows.clear()
+            threading.Thread(target=self.process_existing_windows, daemon=True).start()
+        else:
+            logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
+        
+        logging.info("設定の再読み込みが完了しました。")
+
     def _get_process_name(self, hwnd):
         """ウィンドウハンドルからプロセス名を取得する"""
         try:
@@ -288,48 +335,84 @@ class WindowManager:
             return None
 
     def _check_single_condition(self, window, process_name, class_name, condition):
-        """単一の条件をチェックする"""
+        """
+        単一の条件ブロックをチェックする。
+        ブロック内に複数の条件（title, processなど）がある場合、それらはANDとして評価される。
+        何も条件が指定されていない場合は、Falseを返す。
+        """
         title_pattern = condition.get("title")
         process_pattern = condition.get("process")
         class_pattern = condition.get("class_name")
+        case_sensitive = condition.get("case_sensitive", False)
 
+        # 何も条件がなければマッチしない
+        if not title_pattern and not process_pattern and not class_pattern:
+            return False
+
+        # title check
         if title_pattern:
+            title_matched = False
             try:
                 if title_pattern.startswith("regex:"):
                     pattern = title_pattern.replace("regex:", "", 1)
-                    if re.search(pattern, window.title, re.IGNORECASE if not condition.get("case_sensitive") else 0):
-                        return True
-                elif title_pattern.lower() in window.title.lower():
-                    return True
+                    if re.search(pattern, window.title, 0 if case_sensitive else re.IGNORECASE):
+                        title_matched = True
+                elif case_sensitive:
+                    if title_pattern in window.title:
+                        title_matched = True
+                else: # case-insensitive
+                    if title_pattern.lower() in window.title.lower():
+                        title_matched = True
             except re.error as e:
-                logging.warning(f'タイトル条件の正規表現パターン "{pattern}" が不正です: {e}')
-                return False
+                logging.warning(f'タイトル条件の正規表現 "{title_pattern}" が不正です: {e}')
+            
+            if not title_matched:
+                return False # AND logic
 
-        if process_pattern and process_name:
-            try:
-                if process_pattern.startswith("regex:"):
-                    pattern = process_pattern.replace("regex:", "", 1)
-                    if re.fullmatch(pattern, process_name, re.IGNORECASE if not condition.get("case_sensitive") else 0):
-                        return True
-                elif process_pattern.lower() == process_name.lower():
-                    return True
-            except re.error as e:
-                logging.warning(f'プロセス条件の正規表現パターン "{pattern}" が不正です: {e}')
-                return False
-        
-        if class_pattern and class_name:
-            try:
-                if class_pattern.startswith("regex:"):
-                    pattern = class_pattern.replace("regex:", "", 1)
-                    if re.search(pattern, class_name, re.IGNORECASE if not condition.get("case_sensitive") else 0):
-                        return True
-                elif class_pattern.lower() in class_name.lower():
-                    return True
-            except re.error as e:
-                logging.warning(f'クラス条件の正規表現パターン "{pattern}" が不正です: {e}')
-                return False
+        # process check
+        if process_pattern:
+            process_matched = False
+            if process_name: # process_name can be None
+                try:
+                    if process_pattern.startswith("regex:"):
+                        pattern = process_pattern.replace("regex:", "", 1)
+                        if re.fullmatch(pattern, process_name, 0 if case_sensitive else re.IGNORECASE):
+                            process_matched = True
+                    elif case_sensitive:
+                        if process_pattern == process_name:
+                            process_matched = True
+                    else: # case-insensitive
+                        if process_pattern.lower() == process_name.lower():
+                            process_matched = True
+                except re.error as e:
+                    logging.warning(f'プロセス条件の正規表現 "{process_pattern}" が不正です: {e}')
 
-        return False
+            if not process_matched:
+                return False # AND logic
+
+        # class_name check
+        if class_pattern:
+            class_matched = False
+            if class_name: # class_name can be None
+                try:
+                    if class_pattern.startswith("regex:"):
+                        pattern = class_pattern.replace("regex:", "", 1)
+                        if re.search(pattern, class_name, 0 if case_sensitive else re.IGNORECASE):
+                            class_matched = True
+                    elif case_sensitive:
+                        if class_pattern in class_name:
+                            class_matched = True
+                    else: # case-insensitive
+                        if class_pattern.lower() in class_name.lower():
+                            class_matched = True
+                except re.error as e:
+                    logging.warning(f'クラス条件の正規表現 "{class_pattern}" が不正です: {e}')
+            
+            if not class_matched:
+                return False # AND logic
+
+        # すべての指定された条件がチェックをパスした
+        return True
 
     def _check_rule_conditions(self, window, process_name, class_name, rule_condition):
         """ルールの条件全体（AND/OR）をチェックする"""
@@ -606,32 +689,14 @@ class Tray:
 
     def _clear_log_action(self, icon, item):
         """ログファイルをクリアする"""
-        with self.window_manager.lock:
-            try:
-                log_level_str = self.window_manager.settings.globals.get("log_level", "INFO")
-                log_level = get_log_level_from_string(log_level_str)
-                setup_logging(level=log_level)
-                logging.info("ログファイルをクリアしました。")
-            except Exception as e:
-                print(f"ログファイルのクリア中にエラーが発生しました: {e}")
-                logging.error(f"ログファイルのクリア中にエラーが発生しました: {e}", exc_info=True)
+        self.window_manager.clear_log()
 
     def _toggle_pause_action(self, icon, item):
         """一時停止と再開を切り替える"""
-        with self.window_manager.lock:
-            self.window_manager.is_paused = not self.window_manager.is_paused
-            if self.window_manager.is_paused:
-                self.icon.icon = self.icon_paused
-                logging.info("処理を一時停止しました。")
-            else:
-                self.icon.icon = self.icon_running
-                logging.info("処理を再開しました。")
-                if self.window_manager.settings.globals.get("apply_on_resume", True):
-                    self.window_manager.processed_windows.clear()
-                    logging.info("すべてのウィンドウにルールを再適用します。")
-                    self.window_manager.process_existing_windows()
-                else:
-                    logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
+        if self.window_manager.toggle_pause():
+            self.icon.icon = self.icon_paused
+        else:
+            self.icon.icon = self.icon_running
 
     def _create_default_image(self, width, height, color1, color2):
         """デフォルトのアイコン画像を生成する"""
@@ -643,39 +708,7 @@ class Tray:
 
     def _reload_settings_action(self, icon, item):
         """設定ファイルを再読み込みする"""
-        logging.info("設定の再読み込みを開始します。")
-        
-        apply_on_reload_flag = False
-        try:
-            # ロック内で設定の読み込みと適用を完結させる
-            with self.window_manager.lock:
-                self.window_manager.settings.load()
-                monitors = get_monitors()
-                self.window_manager.calculator = Calculator(monitors, self.window_manager.settings.globals)
-                logging.info(f"{len(monitors)}個のモニター情報を更新しました。")
-
-                log_level_str = self.window_manager.settings.globals.get("log_level", "INFO")
-                log_level = get_log_level_from_string(log_level_str)
-                setup_logging(level=log_level)
-                logging.info(f"ログレベルを「{log_level_str}」に設定しました。")
-                
-                # 後で実行するためにフラグを保持
-                apply_on_reload_flag = self.window_manager.settings.globals.get("apply_on_reload", True)
-
-        except Exception as e:
-            logging.error(f"設定の再読み込み中に予期せぬエラーが発生しました: {e}", exc_info=True)
-            return # エラーが発生した場合はここで終了
-
-        # ロックの外でウィンドウ処理を実行する
-        if apply_on_reload_flag:
-            logging.info("すべてのウィンドウにルールを再適用します。")
-            self.window_manager.processed_windows.clear()
-            # 別のスレッドで実行することで、UIのフリーズを防ぐ
-            threading.Thread(target=self.window_manager.process_existing_windows, daemon=True).start()
-        else:
-            logging.info("新規ウィンドウのみルールを適用します（既存ウィンドウは対象外）。")
-        
-        logging.info("設定の再読み込みが完了しました。")
+        self.window_manager.reload_settings()
 
     def _exit_action(self, icon, item):
         logging.info("アプリケーションを終了します。")
