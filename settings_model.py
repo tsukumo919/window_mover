@@ -31,17 +31,16 @@ class Offset(BaseSettingsModel):
     x: int = 0
     y: int = 0
 
+# --- 型エイリアスを定義 ---
+AnchorPoint = Literal[
+    "TopLeft", "TopCenter", "TopRight",
+    "MiddleLeft", "MiddleCenter", "MiddleRight",
+    "BottomLeft", "BottomCenter", "BottomRight"
+]
+
 class Action(BaseSettingsModel):
-    anchor: Literal[
-        "TopLeft", "TopCenter", "TopRight",
-        "MiddleLeft", "MiddleCenter", "MiddleRight",
-        "BottomLeft", "BottomCenter", "BottomRight"
-    ] = "TopLeft"
-    move_to: Union[Literal[
-        "TopLeft", "TopCenter", "TopRight",
-        "MiddleLeft", "MiddleCenter", "MiddleRight",
-        "BottomLeft", "BottomCenter", "BottomRight"
-    ], MoveTo, None] = None
+    anchor: AnchorPoint = "TopLeft"
+    move_to: Union[AnchorPoint, MoveTo, None] = None
     resize_to: ResizeTo | None = None
     offset: Offset | None = None
     target_monitor: int | None = None

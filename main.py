@@ -731,6 +731,22 @@ class WindowManager:
                 await asyncio.sleep(delay_ms / 1000)
                 logging.info(f" -> {delay_ms}ms の遅延が完了しました。")
 
+            # --- 提案: ここでウィンドウの状態を再チェック ---
+            try:
+                # windowオブジェクトを再取得して最新の状態を反映
+                current_window = gw.Win32Window(window._hWnd)
+                if not current_window.visible or current_window.isMinimized:
+                    logging.warning(f'アクション実行前にウィンドウ "{current_window.title}" が非表示/最小化されたため中断します。')
+                    self._discard_window(window._hWnd)
+                    return
+                # 以降の処理では current_window を使う
+                window = current_window 
+            except gw.PyGetWindowException:
+                logging.warning(f'アクション実行前にウィンドウハンドルが無効になったため中断します。')
+                self._discard_window(window._hWnd)
+                return
+            # --- ここまで ---
+
             if not win32gui.IsWindow(window._hWnd) or not window.visible or window.isMinimized:
                 logging.warning(f'アクション実行前にウィンドウ "{window.title}" が無効になったため、処理を中断します。')
                 self._discard_window(window._hWnd)
