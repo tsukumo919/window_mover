@@ -1,0 +1,41 @@
+# UTF-8
+# VSVersionInfo C-API:
+# https://docs.microsoft.com/ja-jp/windows/win32/api/winver/ns-winver-vs_fixedfileinfo
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    # ファイルバージョン (メジャー, マイナー, ビルド, リビジョン)
+    filevers=(1, 0, 0, 0),
+    # プロダクトバージョン (同上)
+    prodvers=(1, 0, 0, 0),
+    # 常に0x3fでOK
+    mask=0x3f,
+    # 常に0x0でOK
+    flags=0x0,
+    # OS (0x40004 = VOS_NT_WINDOWS32)
+    OS=0x40004,
+    # ファイルタイプ (0x1 = VFT_APP)
+    fileType=0x1,
+    # サブタイプ (0x0 = VFT2_UNKNOWN)
+    subtype=0x0,
+    # タイムスタンプ (0, 0)
+    date=(0, 0)
+    ),
+  kids=[
+    StringFileInfo(
+      [
+      # 言語・コードページ設定 (040904B0 = 米国英語, Unicode)
+      # 日本語の場合は 041104B0
+      StringTable(
+        u'040904B0',
+        [StringStruct(u'CompanyName', u'Tsukumo'),
+        StringStruct(u'FileDescription', u'This tool automatically moves and resizes windows.'),
+        StringStruct(u'FileVersion', u'1.0.0'),
+        StringStruct(u'InternalName', u'WindowMover'),
+        StringStruct(u'LegalCopyright', u'© 2025 Tsukumo. All rights reserved.'),
+        StringStruct(u'OriginalFilename', u'WindowMover.exe'),
+        StringStruct(u'ProductName', u'Window Mover')])
+      ]),
+    # 翻訳情報
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
