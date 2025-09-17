@@ -85,7 +85,8 @@ class Settings:
 
     def _create_default_settings_file(self):
         """デフォルトの設定ファイルを作成する"""
-        default_content = """#==============================================================================
+        default_content = """
+#==============================================================================
 # Window Mover 設定ファイル
 #
 # このファイルでは、ウィンドウをどのように自動で移動・リサイズするかのルールを
@@ -116,6 +117,11 @@ class Settings:
   apply_on_startup = true   # アプリケーション起動時
   apply_on_reload = true    # 設定ファイル再読み込み時
   apply_on_resume = false   # 一時停止から再開した時
+
+  # --- タイトル変更時の再評価 ---
+  # trueに設定すると、ウィンドウのタイトルが変更された際にルールを再評価します。
+  # これにより、ブラウザのタブを切り替えた際などに、タイトルに応じた別のルールを適用できます。
+  recheck_on_title_change = false
 
   # --- クリーンアップ設定 ---
   # 閉じたウィンドウの情報を内部リストから削除する頻度を秒単位で指定します。
@@ -207,7 +213,7 @@ class Settings:
 
   [rules.condition]
     # プロセス名が "mspaint.exe" または "pbrush.exe" に一致
-    process = "regex:(mspaint|pbrush)\.exe"
+    process = "regex:(mspaint|pbrush)\\.exe"
     case_sensitive = false # 大文字・小文字を区別しない (デフォルト)
 
   [rules.action]
@@ -254,6 +260,7 @@ class Settings:
   [rules.action]
     anchor = "MiddleCenter"
     move_to = "MiddleCenter"
+
 """
         try:
             with open(self.filepath, "w", encoding="utf-8") as f:
@@ -433,7 +440,8 @@ class WindowManager:
             logging.critical(f"モニター情報の取得に失敗しました。アプリケーションを続行できません: {e}")
             raise
         self.calculator = Calculator(monitors, self.settings.globals)
-        self.processed_windows = set()
+        # 処理済みウィンドウを、適用されたルール名と共に辞書で管理する
+        self.processed_windows = {}
         self.is_paused = False
         self.lock = threading.Lock()
 
@@ -527,11 +535,9 @@ class WindowManager:
         class_pattern = condition.get("class_name")
         case_sensitive = condition.get("case_sensitive", False)
 
-        # 何も条件がなければマッチしない
         if not title_pattern and not process_pattern and not class_pattern:
             return False
 
-        # title check
         if title_pattern:
             title_matched = False
             try:
@@ -542,19 +548,18 @@ class WindowManager:
                 elif case_sensitive:
                     if title_pattern in window.title:
                         title_matched = True
-                else: # case-insensitive
+                else:
                     if title_pattern.lower() in window.title.lower():
                         title_matched = True
             except re.error as e:
                 logging.warning(f'タイトル条件の正規表現 "{title_pattern}" が不正です: {e}')
             
             if not title_matched:
-                return False # AND logic
+                return False
 
-        # process check
         if process_pattern:
             process_matched = False
-            if process_name: # process_name can be None
+            if process_name:
                 try:
                     if process_pattern.startswith("regex:"):
                         pattern = process_pattern.replace("regex:", "", 1)
@@ -563,19 +568,18 @@ class WindowManager:
                     elif case_sensitive:
                         if process_pattern == process_name:
                             process_matched = True
-                    else: # case-insensitive
+                    else:
                         if process_pattern.lower() == process_name.lower():
                             process_matched = True
                 except re.error as e:
                     logging.warning(f'プロセス条件の正規表現 "{process_pattern}" が不正です: {e}')
 
             if not process_matched:
-                return False # AND logic
+                return False
 
-        # class_name check
         if class_pattern:
             class_matched = False
-            if class_name: # class_name can be None
+            if class_name:
                 try:
                     if class_pattern.startswith("regex:"):
                         pattern = class_pattern.replace("regex:", "", 1)
@@ -584,16 +588,15 @@ class WindowManager:
                     elif case_sensitive:
                         if class_pattern in class_name:
                             class_matched = True
-                    else: # case-insensitive
+                    else:
                         if class_pattern.lower() in class_name.lower():
                             class_matched = True
                 except re.error as e:
                     logging.warning(f'クラス条件の正規表現 "{class_pattern}" が不正です: {e}')
             
             if not class_matched:
-                return False # AND logic
+                return False
 
-        # すべての指定された条件がチェックをパスした
         return True
 
     def _check_rule_conditions(self, window, process_name, class_name, rule_condition):
@@ -606,41 +609,42 @@ class WindowManager:
         try:
             if logic == "OR":
                 return any(self._check_single_condition(window, process_name, class_name, c) for c in conditions)
-            else: # AND
+            else:
                 return all(self._check_single_condition(window, process_name, class_name, c) for c in conditions)
         except Exception as e:
             logging.error(f"ルール条件の評価中にエラーが発生しました: {e}", exc_info=True)
             return False
 
-    def handle_window_event(self, hwnd):
-        """WinEventHookからのコールバック。ウィンドウを処理キューに追加する"""
+    def handle_window_event(self, hwnd, event):
+        """WinEventHookからのコールバック。イベントタイプに応じてウィンドウを処理する"""
         with self.lock:
             if self.is_paused:
                 return
-            # 既に処理済みのウィンドウは無視
-            if hwnd in self.processed_windows:
+
+            is_title_change_event = (event == win32con.EVENT_OBJECT_NAMECHANGE)
+            
+            if is_title_change_event and not self.settings.globals.get("recheck_on_title_change", False):
                 return
-        
-        # イベント発生直後はウィンドウ情報が不完全なことがあるため、リトライロジックを導入
+
+            previously_applied_rule = self.processed_windows.get(hwnd)
+
+            if not is_title_change_event and previously_applied_rule is not None:
+                return
+
         window = None
-        for attempt in range(5):  # 最大5回リトライ
-            time.sleep(0.02)  # 20ms待機
+        for attempt in range(3):
+            time.sleep(0.02)
             try:
                 temp_window = gw.Win32Window(hwnd)
-                # ウィンドウが操作可能か基本的なチェック
                 if temp_window.visible and not temp_window.isMinimized and temp_window.title:
                     window = temp_window
-                    break  # 成功したらループを抜ける
+                    break
             except gw.PyGetWindowException:
-                logging.debug(f"HWND {hwnd} のウィンドウはリトライ中に閉じられました。")
-                return # ウィンドウが消えたので処理終了
-            except Exception as e:
-                # 予期せぬエラーはデバッグログに出力してリトライを続ける
-                logging.debug(f"HWND {hwnd} の情報取得中に予期せぬエラー (試行 {attempt + 1}): {e}")
-                pass # その他のエラーならリトライを続ける
+                return
+            except Exception:
+                pass
 
         if not window:
-            logging.debug(f"リトライ後も HWND {hwnd} のウィンドウ情報を取得できませんでした。")
             return
             
         try:
@@ -650,32 +654,51 @@ class WindowManager:
             try:
                 class_name = win32gui.GetClassName(hwnd)
             except win32gui.error:
-                class_name = None # ウィンドウが既に存在しない場合など
+                class_name = None
 
             process_name = self._get_process_name(hwnd)
-            logging.debug(f"イベント受信: タイトル='{window.title}', プロセス='{process_name}', クラス='{class_name}'")
+            
+            event_name = "作成/表示" if not is_title_change_event else "タイトル変更"
+            logging.debug(f"イベント受信 ({event_name}): タイトル='{window.title}', プロセス='{process_name}', クラス='{class_name}'")
 
-            # 新しい無視ルールをチェック
+            # 無視ルールは常に最優先
             for ignore_rule in self.settings.ignores:
                 if self._check_rule_conditions(window, process_name, class_name, ignore_rule):
                     ignore_name = ignore_rule.get("name", "無名無視ルール")
                     logging.info(f"無視ルール '{ignore_name}' に一致したため、ウィンドウ '{window.title}' の処理をスキップします。")
                     with self.lock:
-                        self.processed_windows.add(hwnd)
+                        self.processed_windows[hwnd] = "ignored" # 無視したことも記録
                     return
 
+            # ルール評価
+            matched_rule = None
             for rule in self.settings.rules:
                 if self._check_rule_conditions(window, process_name, class_name, rule.get("condition", {})):
-                    with self.lock:
-                        if hwnd in self.processed_windows: # ダブルチェック
-                            continue
-                        self.processed_windows.add(hwnd)
-                    
-                    # 非同期タスクをスレッドセーフに呼び出す
-                    asyncio.run_coroutine_threadsafe(self._apply_rule_async(rule, window), self.loop)
+                    matched_rule = rule
                     break
+            
+            if matched_rule:
+                rule_name = matched_rule.get("name", "無名ルール")
+                # タイトル変更イベントで、かつ前回適用されたルールと同じ場合はアクションをスキップ
+                if is_title_change_event and previously_applied_rule == rule_name:
+                    logging.debug(f"タイトルは変更されましたが、前回と同じルール '{rule_name}' にマッチしたため、アクションは再実行しません。")
+                    return
+
+                # 新規適用、または別のルールへの変更
+                log_prefix = "新規ルール適用:" if not previously_applied_rule else f"ルール変更 ({previously_applied_rule} -> {rule_name}):"
+                logging.info(f"{log_prefix} '{window.title}' にルール '{rule_name}' を適用します。")
+                
+                with self.lock:
+                    self.processed_windows[hwnd] = rule_name
+                
+                asyncio.run_coroutine_threadsafe(self._apply_rule_async(matched_rule, window), self.loop)
+
+            elif previously_applied_rule:
+                # どのルールにもマッチしなくなった場合
+                logging.info(f"ウィンドウ '{window.title}' はどのルールにもマッチしなくなったため、追跡を解除します。(旧ルール: {previously_applied_rule})")
+                self._discard_window(hwnd)
+
         except gw.PyGetWindowException:
-            # ウィンドウが既に閉じられている場合など
             pass
         except Exception as e:
             logging.error(f"ウィンドウイベント処理中にエラーが発生しました (HWND: {hwnd}): {e}", exc_info=True)
@@ -690,7 +713,8 @@ class WindowManager:
         try:
             for window in gw.getAllWindows():
                 if window.visible and not window.isMinimized and window.title:
-                    self.handle_window_event(window._hWnd)
+                    # 既存ウィンドウは新規作成イベントとして扱う
+                    self.handle_window_event(window._hWnd, win32con.EVENT_OBJECT_CREATE)
         except Exception as e:
             logging.error(f"既存ウィンドウの処理中にエラー: {e}", exc_info=True)
 
@@ -698,22 +722,22 @@ class WindowManager:
         """非同期で単一のルールをウィンドウに適用する"""
         rule_name = rule.get("name", "無名ルール")
         action = rule.get("action", {})
-        logging.info(f'非同期タスク開始: ルール "{rule_name}" を "{window.title}" に適用します。')
-
+        
         try:
+            # execution_delay はアクションの実行を遅延させる
             delay_ms = action.get("execution_delay")
             if isinstance(delay_ms, int) and delay_ms > 0:
-                logging.info(f" -> {delay_ms}ms の遅延を開始します。")
+                logging.info(f" -> アクション実行を {delay_ms}ms 遅延します。")
                 await asyncio.sleep(delay_ms / 1000)
                 logging.info(f" -> {delay_ms}ms の遅延が完了しました。")
 
-            if not window.visible or window.isMinimized:
-                logging.warning(f'遅延後、ウィンドウ "{window.title}" が非表示または最小化されたため、処理を中断します。')
+            if not win32gui.IsWindow(window._hWnd) or not window.visible or window.isMinimized:
+                logging.warning(f'アクション実行前にウィンドウ "{window.title}" が無効になったため、処理を中断します。')
                 self._discard_window(window._hWnd)
                 return
 
             with self.lock:
-                if not window.visible or window.isMinimized:
+                if not win32gui.IsWindow(window._hWnd) or not window.visible or window.isMinimized:
                     self._discard_window(window._hWnd)
                     return
 
@@ -735,7 +759,7 @@ class WindowManager:
                 elif action.get("minimize", "").upper() == "ON":
                     window.minimize()
                     logging.info(" -> ウィンドウを最小化しました。")
-                else:
+                elif action.get("move_to") or action.get("resize_to"):
                     x, y, w, h = self.calculator.get_target_rect(action, window)
                     
                     current_left, current_top, current_width, current_height = window.left, window.top, window.width, window.height
@@ -755,13 +779,12 @@ class WindowManager:
             self._discard_window(window._hWnd)
 
     def _discard_window(self, hwnd):
-        """処理済みセットからウィンドウを安全に削除する"""
+        """処理済み辞書からウィンドウを安全に削除する"""
         with self.lock:
-            self.processed_windows.discard(hwnd)
+            self.processed_windows.pop(hwnd, None)
 
     async def _cleanup_processed_windows_periodically(self):
-        """processed_windows セットを定期的にクリーンアップする"""
-        # settings.toml から間隔を読み込む (デフォルトは5分)
+        """processed_windows 辞書を定期的にクリーンアップする"""
         cleanup_interval = self.settings.globals.get("cleanup_interval_seconds", 300)
         logging.info(f"{cleanup_interval}秒ごとに無効なウィンドウハンドルのクリーンアップを実行します。")
         
@@ -773,11 +796,11 @@ class WindowManager:
 
                 logging.debug(f"クリーンアップ開始: 現在 {len(self.processed_windows)}個のウィンドウを追跡中。")
                 
-                # 存在しないウィンドウのハンドルを特定
                 invalid_hwnds = {hwnd for hwnd in self.processed_windows if not win32gui.IsWindow(hwnd)}
                 
                 if invalid_hwnds:
-                    self.processed_windows.difference_update(invalid_hwnds)
+                    for hwnd in invalid_hwnds:
+                        self.processed_windows.pop(hwnd, None)
                     logging.info(f"{len(invalid_hwnds)}個の無効なウィンドウハンドルをクリーンアップしました。")
 
 # --- Win32 イベントフック (ctypes) ---
@@ -789,7 +812,7 @@ class WinEventHook(threading.Thread):
     def __init__(self, callback):
         super().__init__(name="WinEventHookThread", daemon=True)
         self.callback = callback
-        self.hook = None
+        self.hooks = []
         self.running = False
         self.user32 = ctypes.windll.user32
         self.event_proc_obj = WINEVENTPROC(self.event_proc)
@@ -798,19 +821,25 @@ class WinEventHook(threading.Thread):
         """イベントフックを開始し、メッセージループに入る"""
         self.running = True
         try:
-            self.hook = self.user32.SetWinEventHook(
-                win32con.EVENT_OBJECT_CREATE,
-                win32con.EVENT_OBJECT_SHOW,
-                0, self.event_proc_obj, 0, 0, win32con.WINEVENT_OUTOFCONTEXT
-            )
-            if self.hook:
-                logging.info("Win32 イベントフックを開始しました。")
-                msg = wintypes.MSG()
-                while self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-                    self.user32.TranslateMessage(ctypes.byref(msg))
-                    self.user32.DispatchMessageW(ctypes.byref(msg))
-            else:
+            # 複数のイベントフックをセットアップ
+            self.hooks.append(self.user32.SetWinEventHook(
+                win32con.EVENT_OBJECT_CREATE, win32con.EVENT_OBJECT_SHOW,
+                0, self.event_proc_obj, 0, 0, win32con.WINEVENT_OUTOFCONTEXT | win32con.WINEVENT_SKIPOWNPROCESS))
+            
+            self.hooks.append(self.user32.SetWinEventHook(
+                win32con.EVENT_OBJECT_NAMECHANGE, win32con.EVENT_OBJECT_NAMECHANGE,
+                0, self.event_proc_obj, 0, 0, win32con.WINEVENT_OUTOFCONTEXT | win32con.WINEVENT_SKIPOWNPROCESS))
+
+            if not all(self.hooks):
                 logging.error("Win32 イベントフックの開始に失敗しました。")
+                return
+
+            logging.info("Win32 イベントフックを開始しました。(CREATE, SHOW, NAMECHANGE)")
+            msg = wintypes.MSG()
+            while self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                self.user32.TranslateMessage(ctypes.byref(msg))
+                self.user32.DispatchMessageW(ctypes.byref(msg))
+
         except Exception as e:
             logging.critical(f"WinEventフックスレッドで致命的なエラー: {e}", exc_info=True)
         finally:
@@ -818,26 +847,27 @@ class WinEventHook(threading.Thread):
 
     def stop(self):
         """イベントフックを解除し、メッセージループを終了する"""
-        if self.hook:
-            self.user32.UnhookWinEvent(self.hook)
-            self.hook = None
-            logging.info("Win32 イベントフックを解除しました。")
+        for h in self.hooks:
+            if h:
+                self.user32.UnhookWinEvent(h)
+        self.hooks = []
+        logging.info("すべてのWin32 イベントフックを解除しました。")
+
         if self.running:
             self.user32.PostThreadMessageW(self.ident, win32con.WM_QUIT, 0, 0)
         self.running = False
 
     def event_proc(self, hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
         """イベントコールバック関数"""
-        if dwEventThread == self.ident:
-            return
         if idObject != win32con.OBJID_WINDOW or idChild != 0:
             return
         if not hwnd or not win32gui.IsWindow(hwnd) or win32gui.GetParent(hwnd) != 0:
             return
         try:
-            self.callback(hwnd)
+            # コールバックにイベントタイプを渡す
+            self.callback(hwnd, event)
         except Exception as e:
-            logging.error(f"イベント処理コールバックでエラー (HWND: {hwnd}): {e}", exc_info=True)
+            logging.error(f"イベント処理コールバックでエラー (HWND: {hwnd}, Event: {event}): {e}", exc_info=True)
 
 # --- システムトレイ ---
 class Tray:

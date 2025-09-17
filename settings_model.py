@@ -69,6 +69,7 @@ class GlobalSettings(BaseSettingsModel):
     apply_on_startup: bool = True
     apply_on_reload: bool = True
     apply_on_resume: bool = False
+    recheck_on_title_change: bool = False
     cleanup_interval_seconds: int = 300
     monitor_offsets: Dict[str, Dict[str, int]] = Field(default_factory=dict)
 
