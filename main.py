@@ -909,12 +909,27 @@ class Tray:
                 self._toggle_pause_action
             ),
             pystray.MenuItem("設定を再読み込み", self._reload_settings_action),
+            pystray.MenuItem("設定ファイルを編集", self._open_settings_action),
             pystray.MenuItem("ログを開く", self._open_log_action),
             pystray.MenuItem("ログをクリア", self._clear_log_action),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("終了", self._exit_action)
         )
         self.icon = pystray.Icon("window_mover", self.icon_running, "Window Mover", menu)
+
+    def _open_settings_action(self, icon, item):
+        """設定ファイルをnotepad.exeで開く"""
+        try:
+            settings_path = self.window_manager.settings.filepath
+            if os.path.exists(settings_path):
+                subprocess.run(["notepad.exe", settings_path])
+                logging.info(f"設定ファイル '{settings_path}' を開きました。")
+            else:
+                logging.warning(f"設定ファイル '{settings_path}' が見つかりません。")
+        except FileNotFoundError:
+            logging.error("notepad.exeが見つかりませんでした。パスが通っているか確認してください。")
+        except Exception as e:
+            logging.error(f"設定ファイルを開く際にエラーが発生しました: {e}", exc_info=True)
 
     def _open_log_action(self, icon, item):
         """ログファイルをnotepad.exeで開く"""
