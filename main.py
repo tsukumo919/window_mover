@@ -922,7 +922,7 @@ class Tray:
         try:
             settings_path = self.window_manager.settings.filepath
             if os.path.exists(settings_path):
-                subprocess.run(["notepad.exe", settings_path])
+                subprocess.Popen(["notepad.exe", settings_path])
                 logging.info(f"設定ファイル '{settings_path}' を開きました。")
             else:
                 logging.warning(f"設定ファイル '{settings_path}' が見つかりません。")
@@ -936,7 +936,7 @@ class Tray:
         try:
             # LOG_FILEはmain()で絶対パスに更新されているグローバル変数
             if os.path.exists(LOG_FILE):
-                subprocess.run(["notepad.exe", LOG_FILE])
+                subprocess.Popen(["notepad.exe", LOG_FILE])
                 logging.info(f"ログファイル '{LOG_FILE}' を開きました。")
             else:
                 logging.warning(f"ログファイル '{LOG_FILE}' が見つかりません。")
